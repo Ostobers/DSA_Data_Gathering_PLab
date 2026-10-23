@@ -1,0 +1,18 @@
+body{font-family:Arial,Helvetica,sans-serif;max-width:760px;margin:0 auto;padding:1rem;line-height:1.45;color:#222}
+nav{padding-bottom:.6rem;border-bottom:1px solid #ccc}
+nav a{margin-right:.9rem}
+fieldset{border:1px solid #bbb;margin:1rem 0;padding:.8rem}
+fieldset.invalid{border-color:#b00020}
+legend{font-weight:bold}
+label{display:block;margin:.3rem 0}
+input[type=text],input[type=email],input[type=number],textarea,select{width:100%;padding:.45rem;box-sizing:border-box;font-size:1rem}
+.oth{margin-top:.4rem}
+.note{font-size:.85rem;color:#555;margin:.2rem 0}
+.err{color:#b00020;font-size:.9rem;margin-top:.3rem}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse}
+th,td{border:1px solid #ddd;padding:.3rem;font-size:.85rem;text-align:center}
+td:first-child{text-align:left;min-width:9rem}
+button{padding:.6rem 1.2rem;font-size:1rem;cursor:pointer}
+pre{white-space:pre-wrap;background:#f4f4f4;padding:.6rem;font-size:.8rem}
+[hidden]{display:none!important}

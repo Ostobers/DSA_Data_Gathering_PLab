@@ -1,3 +1,7 @@
 venv/
 __pycache__/
 .DS_Store
+
+# Local design artifacts and project readme
+design_docs/
+README.md

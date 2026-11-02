@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}{{ student.name }}{% endblock %}
+{% block content %}
+<p><a href="{{ url_for('faculty_home') }}">Back to dashboard</a></p>
+<h1>{{ student.name }}</h1>
+<p class="note">{{ student.id }} · {{ student.email }} · {{ student.population }} · {{ student.term }}</p>
+
+<section class="stats">
+  <div class="stat"><b>{{ student.confidence or "—" }}</b><span>Confidence</span></div>
+  <div class="stat"><b>{{ student.belonging or "—" }}</b><span>Belonging</span></div>
+  <div class="stat"><b>{{ student.workload or "—" }}</b><span>Workload</span></div>
+  <div class="stat"><b>{{ student.financial or "—" }}</b><span>Financial pressure</span></div>
+  <div class="stat"><b>{{ student.job or "—" }}</b><span>Job-search progress</span></div>
+</section>
+
+<div class="grid-2">
+  <article class="card">
+    <h2>Alerts for this student</h2>
+    {% for alert in alerts %}
+      <p>
+        <span class="tag {% if alert.status == 'active' %}bad{% else %}ok{% endif %}">{{ alert.status }}</span>
+        <strong>{{ alert.type }}</strong><br>
+        Rule: {{ alert.rule }}<br>
+        Value: {{ alert.value }}
+      </p>
+    {% else %}
+      <p>No alerts. Faculty can still review the check-in history below.</p>
+    {% endfor %}
+  </article>
+  <article class="card">
+    <h2>Readiness snapshot</h2>
+    <p>Prerequisite gaps: {{ student.gaps }}</p>
+    <p>Job-search stage: {{ student.job_stage }}</p>
+    <p>Advising requested: {{ "Yes" if student.advising else "No" }}</p>
+    {% if student.employment %}
+      <h3>Graduate employment</h3>
+      <p>{{ student.employment.status }} · {{ student.employment.title }} · {{ student.employment.industry }}</p>
+      <p>Uses data-science skills: {{ student.employment.uses_ds }}</p>
+    {% endif %}
+  </article>
+</div>
+
+<section class="card" style="margin-top:1rem">
+  <h2>Check-ins over time</h2>
+  {% if student.checkins %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Date</th><th>Confidence</th><th>Belonging</th><th>Satisfaction</th>
+          <th>Workload</th><th>Financial</th><th>Job</th><th>Advising</th><th>Comment</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in student.checkins %}
+        <tr>
+          <td>{{ row.date }}</td>
+          <td>{{ row.confidence }}</td>
+          <td>{{ row.belonging }}</td>
+          <td>{{ row.satisfaction }}</td>
+          <td>{{ row.workload }}</td>
+          <td>{{ row.financial }}</td>
+          <td>{{ row.job }}</td>
+          <td>{{ "Yes" if row.advising else "No" }}</td>
+          <td>{{ row.comment or "—" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p>No check-in history for this person yet.</p>
+  {% endif %}
+</section>
+{% endblock %}

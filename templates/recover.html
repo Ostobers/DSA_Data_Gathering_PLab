@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Recover password{% endblock %}
+{% block content %}
+<div class="card auth-card">
+  <h1>Recover password</h1>
+  <p class="note">Enter the email on your account. If it matches a user, we will show a recovery confirmation. This page does not reveal whether an email is registered.</p>
+  <form method="POST" action="{{ url_for('recover') }}">
+    {{ form.hidden_tag() }}
+    <label for="email">Email</label>
+    {{ form.email(id="email", type="email", autocomplete="email") }}
+    <p><button type="submit">Send recovery instructions</button></p>
+  </form>
+  <p><a href="{{ url_for('login') }}">Back to log in</a></p>
+</div>
+{% endblock %}

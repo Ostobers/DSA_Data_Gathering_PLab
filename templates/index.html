@@ -1,16 +1,49 @@
-<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DSA MS Student Success Surveys</title><link rel="stylesheet" href="style.css"></head>
-<body>
-<a href ="{{url_for('login')}}">Login Page</a><br>
-<a href ="{{url_for('register')}}">Register Page</a><br>
-<h1>DSA MS Student Success Surveys</h1>
-<p>Prototype. Each survey has a Short and a Long version. Responses are <strong>not saved</strong>.</p>
-<ul>
-<li><a href="applicant.html">Applicant Survey</a></li>
-<li><a href="current-student.html">Current Student Survey</a></li>
-<li><a href="near-graduation.html">Near Graduation Survey</a></li>
-<li><a href="after-graduation.html">After Graduation Survey</a></li>
-</ul>
-</body></html>
+{% extends "base.html" %}
+{% block title %}DSA MS Student Success{% endblock %}
+{% block content %}
+<section class="hero">
+  <h1>A small system for retention and placement</h1>
+  <p>Collect better data, understand student needs, notice concerns early, and support advising and job-placement decisions for the Data Science and Analytics MS program.</p>
+  <div class="actions">
+    {% if user %}
+      {% if user.role == 'student' %}
+        <a class="btn" href="{{ url_for('student_home') }}">Go to my dashboard</a>
+      {% elif user.role == 'faculty' %}
+        <a class="btn" href="{{ url_for('faculty_home') }}">Open faculty dashboard</a>
+      {% else %}
+        <a class="btn" href="{{ url_for('admin_home') }}">Open admin dashboard</a>
+      {% endif %}
+    {% else %}
+      <a class="btn" href="{{ url_for('login') }}">Log in</a>
+      <a class="btn secondary" href="{{ url_for('recover') }}">Forgot password</a>
+    {% endif %}
+  </div>
+</section>
+
+<section class="grid-3">
+  <article class="card">
+    <h2>Applicants</h2>
+    <p>Preparation, prerequisite gaps, expectations, and reasons for applying.</p>
+  </article>
+  <article class="card">
+    <h2>Current students</h2>
+    <p>Confidence, belonging, workload, advising needs, and job-search progress over time.</p>
+  </article>
+  <article class="card">
+    <h2>Graduates</h2>
+    <p>Employment outcomes and retrospective program feedback.</p>
+  </article>
+</section>
+
+<section class="card" style="margin-top:1rem">
+  <h2>What faculty should be able to see</h2>
+  <ul>
+    <li>Who asked for help</li>
+    <li>Low confidence or belonging</li>
+    <li>Prerequisite gaps</li>
+    <li>Near-graduation students with little job-search progress</li>
+    <li>Transparent, rule-based alerts</li>
+  </ul>
+  <p class="note">Survey forms are separate. This set of pages covers accounts, role-specific dashboards, profile, and password recovery.</p>
+</section>
+{% endblock %}

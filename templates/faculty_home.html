@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}Faculty dashboard{% endblock %}
+{% block content %}
+<h1>Faculty dashboard</h1>
+<p class="note">Scan active alerts, readiness concerns, advising requests, and job-search progress. Alerts show the student, the rule, and the triggering value. They do not recommend an intervention.</p>
+
+<section class="stats">
+  <div class="stat"><b>{{ totals.current }}</b><span>Current students</span></div>
+  <div class="stat"><b>{{ totals.alerts }}</b><span>Active alerts</span></div>
+  <div class="stat"><b>{{ totals.advising }}</b><span>Asked for advising</span></div>
+  <div class="stat"><b>{{ totals.low_confidence }}</b><span>Low confidence (≤2)</span></div>
+  <div class="stat"><b>{{ totals.gaps }}</b><span>Prerequisite gaps</span></div>
+</section>
+
+<section class="card">
+  <h2>Active alerts</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Student</th>
+          <th>Alert type</th>
+          <th>Rule</th>
+          <th>Triggering value</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for alert in alerts if alert.status == 'active' %}
+        <tr>
+          <td><a href="{{ url_for('student_detail', student_id=alert.student_id) }}">{{ alert.student }}</a></td>
+          <td><span class="tag bad">{{ alert.type }}</span></td>
+          <td>{{ alert.rule }}</td>
+          <td>{{ alert.value }}</td>
+          <td>
+            <form method="POST" action="{{ url_for('review_alert', alert_id=alert.id) }}">
+              <button type="submit">Mark reviewed</button>
+            </form>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5">No active alerts. That is an empty state, not missing data.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="card" style="margin-top:1rem">
+  <h2>Students</h2>
+  <form class="filter-bar" method="GET">
+    <input type="search" name="q" value="{{ q }}" placeholder="Search name">
+    <select name="population">
+      <option value="">All populations</option>
+      {% for p in populations %}
+        <option value="{{ p }}" {% if population == p %}selected{% endif %}>{{ p }}</option>
+      {% endfor %}
+    </select>
+    <select name="flag">
+      <option value="">All flags</option>
+      <option value="advising" {% if flag == 'advising' %}selected{% endif %}>Advising requested</option>
+      <option value="low_confidence" {% if flag == 'low_confidence' %}selected{% endif %}>Low confidence</option>
+      <option value="gaps" {% if flag == 'gaps' %}selected{% endif %}>Prerequisite gaps</option>
+      <option value="job" {% if flag == 'job' %}selected{% endif %}>Weak job-search progress</option>
+    </select>
+    <button type="submit">Filter</button>
+  </form>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Population</th>
+          <th>Term</th>
+          <th>Gaps</th>
+          <th>Confidence</th>
+          <th>Belonging</th>
+          <th>Job search</th>
+          <th>Advising</th>
+          <th>Latest check-in</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in students %}
+        <tr>
+          <td><a href="{{ url_for('student_detail', student_id=s.id) }}">{{ s.name }}</a></td>
+          <td>{{ s.population }}</td>
+          <td>{{ s.term }}</td>
+          <td>{% if s.gaps != "None reported" %}<span class="tag warn">{{ s.gaps }}</span>{% else %}None{% endif %}</td>
+          <td>{{ s.confidence if s.confidence is not none else "—" }}</td>
+          <td>{{ s.belonging if s.belonging is not none else "—" }}</td>
+          <td>{{ s.job if s.job is not none else "—" }} · {{ s.job_stage }}</td>
+          <td>{% if s.advising %}<span class="tag bad">Yes</span>{% else %}No{% endif %}</td>
+          <td>{{ s.latest_checkin or "—" }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="9">No students match this filter.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Recovery instructions{% endblock %}
+{% block content %}
+<div class="card auth-card">
+  <h1>Check your email</h1>
+  <p>If an account exists for that address, password recovery instructions have been queued. For this prototype, email is not sent; a program administrator can reset a password from the Accounts page.</p>
+  <p><a class="btn" href="{{ url_for('login') }}">Return to log in</a></p>
+</div>
+{% endblock %}

@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}My dashboard{% endblock %}
+{% block content %}
+<h1>Hello, {{ user.name }}</h1>
+<p class="note">You can see only your own records. Previous check-ins stay saved when you submit a new one.</p>
+
+<section class="stats">
+  <div class="stat"><b class="score">{{ student.confidence or "—" }}</b><span>Confidence (1–5)</span></div>
+  <div class="stat"><b class="score">{{ student.belonging or "—" }}</b><span>Belonging (1–5)</span></div>
+  <div class="stat"><b class="score">{{ student.workload or "—" }}</b><span>Workload pressure</span></div>
+  <div class="stat"><b class="score">{{ student.job or "—" }}</b><span>Job-search progress</span></div>
+</section>
+
+<section class="grid-2">
+  <article class="card">
+    <h2>Latest check-in</h2>
+    {% if student.latest_checkin %}
+      <p>Submitted {{ student.latest_checkin }}. Job-search stage: <strong>{{ student.job_stage }}</strong>.</p>
+      <p>Advising help requested: <strong>{{ "Yes" if student.advising else "No" }}</strong></p>
+    {% else %}
+      <p>No check-in yet.</p>
+    {% endif %}
+    <p><a class="btn" href="{{ url_for('static_page', filename='current-student.html') }}">Start or update a check-in</a></p>
+    <p class="note">The check-in form itself is the survey page. This dashboard only shows your history and status.</p>
+  </article>
+  <article class="card">
+    <h2>My profile snapshot</h2>
+    <p>Population: {{ student.population }}<br>
+       Term: {{ student.term }}<br>
+       Prerequisite gaps: {{ student.gaps }}</p>
+    <p><a class="ghost btn" href="{{ url_for('profile') }}">Edit account profile</a>
+       <a class="ghost btn" href="{{ url_for('history') }}">View check-in history</a></p>
+  </article>
+</section>
+{% endblock %}

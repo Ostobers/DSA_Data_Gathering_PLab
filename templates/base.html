@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}DSA MS Student Success{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+<body>
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="{{ url_for('index') }}">
+        <strong>DSA MS Student Success</strong>
+        <span>Buffalo State · Data Science &amp; Analytics</span>
+      </a>
+      <nav class="site-nav" aria-label="Main">
+        <a href="{{ url_for('index') }}" {% if request.endpoint == 'index' %}aria-current="page"{% endif %}>Home</a>
+        {% if user %}
+          {% if user.role == 'student' %}
+            <a href="{{ url_for('student_home') }}" {% if request.endpoint == 'student_home' %}aria-current="page"{% endif %}>My dashboard</a>
+            <a href="{{ url_for('history') }}" {% if request.endpoint == 'history' %}aria-current="page"{% endif %}>Check-in history</a>
+          {% elif user.role == 'faculty' %}
+            <a href="{{ url_for('faculty_home') }}" {% if request.endpoint == 'faculty_home' %}aria-current="page"{% endif %}>Faculty dashboard</a>
+          {% elif user.role == 'admin' %}
+            <a href="{{ url_for('admin_home') }}" {% if request.endpoint == 'admin_home' %}aria-current="page"{% endif %}>Admin dashboard</a>
+            <a href="{{ url_for('users') }}" {% if request.endpoint == 'users' %}aria-current="page"{% endif %}>Accounts</a>
+          {% endif %}
+          <a href="{{ url_for('profile') }}" {% if request.endpoint == 'profile' %}aria-current="page"{% endif %}>Profile</a>
+          <a href="{{ url_for('logout') }}">Log out</a>
+        {% else %}
+          <a href="{{ url_for('login') }}" {% if request.endpoint == 'login' %}aria-current="page"{% endif %}>Log in</a>
+        {% endif %}
+      </nav>
+    </div>
+  </header>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      {% for category, message in messages %}
+        <div class="flash {% if category == 'error' %}error{% endif %}" role="status">{{ message }}</div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+
+  <main class="site-main">
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="site-footer">
+    <div class="footer-inner">
+      Internal DSA MS program tool. Student records are not public. Alerts support faculty judgment; they do not recommend interventions.
+    </div>
+  </footer>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

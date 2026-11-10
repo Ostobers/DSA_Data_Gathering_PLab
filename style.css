@@ -17,5 +17,15 @@ table{border-collapse:collapse}
 th,td{border:1px solid #ddd;padding:.3rem;font-size:.85rem;text-align:center}
 td:first-child{text-align:left;min-width:9rem}
 button{padding:.6rem 1.2rem;font-size:1rem;cursor:pointer;background:var(--orange);color:#fff;border:0;border-radius:.4rem;font-weight:600}
+.repeat-items{display:grid;gap:1rem;margin:.75rem 0}
+.repeat-item{border:1px solid var(--line);border-radius:.5rem;padding:.8rem;background:#fafafa}
+.repeat-heading{display:flex;align-items:center;justify-content:space-between;gap:1rem}
+.repeat-heading h4{margin:.2rem 0}
+.repeat-field{margin:.8rem 0}
+.repeat-field.invalid{border-left:3px solid var(--bad);padding-left:.6rem}
+.repeat-label{font-weight:bold;margin:.3rem 0}
+.remove-repeat{background:#fff;color:var(--bad);border:1px solid var(--bad);padding:.35rem .65rem;font-size:.85rem}
+.remove-repeat:disabled{cursor:not-allowed;opacity:.45}
+.add-repeat{margin-top:.25rem}
 pre{white-space:pre-wrap;background:#f4f4f4;padding:.6rem;font-size:.8rem}
 [hidden]{display:none!important}

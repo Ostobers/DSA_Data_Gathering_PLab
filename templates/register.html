@@ -1,23 +1,14 @@
-<!DOCTYPE html>
-<html>	
-<head>
-	<meta name="viewport" content="width=device-width,initial-scale=1">
-	<title>Register Page</title>
-</head>
-
-<body>
-
-	<h1>Register Page</h1>
-	<p>This is a paragraph.</p>
-
-	<form method="POST" action="">
-		{{ form.hidden_tag() }}
-		{{ form.username }}
-		{{ form.password }}
-		{{ form.submit }}
-	</form>
-
-	<a href ="{{url_for('login')}}">Already have an account? Click here!</a><br>
-	<a href ="{{url_for('index')}}">Index Page</a><br>
-</body>
-</html>
+{% extends "base.html" %}
+{% block title %}Request an account{% endblock %}
+{% block content %}
+<div class="card auth-card">
+  <p class="eyebrow">Program access</p>
+  <h1>Request an account</h1>
+  <p>Student records are private, so accounts are created by a program administrator rather than through public self-registration.</p>
+  <p>Contact your DSA program administrator using your Buffalo State email address. They will assign the correct student, faculty, or administrator role.</p>
+  <div class="actions">
+    <a class="btn" href="{{ url_for('login') }}">Return to log in</a>
+    <a class="btn ghost" href="{{ url_for('index') }}">Return home</a>
+  </div>
+</div>
+{% endblock %}

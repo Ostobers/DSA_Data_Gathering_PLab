@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
 </head>
 <body>
+  <a class="skip-link" href="#main-content">Skip to main content</a>
   <header class="site-header">
     <div class="header-inner">
       <a class="brand" href="{{ url_for('index') }}">
@@ -37,12 +38,12 @@
   {% with messages = get_flashed_messages(with_categories=true) %}
     {% if messages %}
       {% for category, message in messages %}
-        <div class="flash {% if category == 'error' %}error{% endif %}" role="status">{{ message }}</div>
+        <div class="flash {% if category == 'error' %}error{% endif %}" role="{% if category == 'error' %}alert{% else %}status{% endif %}">{{ message }}</div>
       {% endfor %}
     {% endif %}
   {% endwith %}
 
-  <main class="site-main">
+  <main class="site-main" id="main-content">
     {% block content %}{% endblock %}
   </main>
 

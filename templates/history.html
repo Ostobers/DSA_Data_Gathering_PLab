@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Check-in history{% endblock %}
+{% block content %}
+<h1>Check-in history</h1>
+<p class="note">Repeated check-ins are stored with timestamps. Earlier responses are not overwritten.</p>
+{% if student.checkins %}
+<div class="table-wrap card">
+  <table>
+    <thead>
+      <tr>
+        <th>Date</th>
+        <th>Confidence</th>
+        <th>Belonging</th>
+        <th>Satisfaction</th>
+        <th>Workload</th>
+        <th>Financial</th>
+        <th>Job search</th>
+        <th>Advising</th>
+        <th>Comment</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in student.checkins %}
+      <tr>
+        <td>{{ row.date }}</td>
+        <td>{{ row.confidence }}</td>
+        <td>{{ row.belonging }}</td>
+        <td>{{ row.satisfaction }}</td>
+        <td>{{ row.workload }}</td>
+        <td>{{ row.financial }}</td>
+        <td>{{ row.job }}</td>
+        <td>{{ "Yes" if row.advising else "No" }}</td>
+        <td>{{ row.comment or "—" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="card"><p>No check-ins yet. When you complete one, it will appear here.</p></div>
+{% endif %}
+{% endblock %}

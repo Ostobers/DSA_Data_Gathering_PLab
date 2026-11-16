@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Administrator dashboard{% endblock %}
+{% block content %}
+<h1>Program administrator</h1>
+<p class="note">Full access: users, dashboards, and configuration. This page is a frontend shell until the database is connected.</p>
+
+<section class="stats">
+  <div class="stat"><b>{{ totals.people }}</b><span>People in seed data</span></div>
+  <div class="stat"><b>{{ user_count }}</b><span>App accounts</span></div>
+  <div class="stat"><b>{{ totals.alerts }}</b><span>Active alerts</span></div>
+  <div class="stat"><b>{{ totals.current }}</b><span>Current students</span></div>
+</section>
+
+<div class="grid-2">
+  <article class="card">
+    <h2>Accounts and roles</h2>
+    <p>Create, disable, and assign Student, Faculty, or Administrator roles.</p>
+    <p><a class="btn" href="{{ url_for('users') }}">Manage accounts</a></p>
+  </article>
+  <article class="card">
+    <h2>Faculty view</h2>
+    <p>Administrators can open the same dashboard faculty use in advising meetings.</p>
+    <p><a class="btn ghost" href="{{ url_for('faculty_home') }}">Open faculty dashboard</a></p>
+  </article>
+</div>
+{% endblock %}

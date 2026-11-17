@@ -1,5 +1,6 @@
 """Flask app with server-side role gates for Jinja templates."""
 
+import os
 from functools import wraps
 
 from flask import Flask, flash, redirect, render_template, request, send_from_directory, session, url_for
@@ -10,7 +11,9 @@ from wtforms.validators import InputRequired, Length
 import seed_data
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "DONOTSHARE"
+# Prefer SECRET_KEY from the environment (compose/.env). Lab fallback keeps
+# bare `python Hello.py` working locally; docker-compose supplies a real value.
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "DONOTSHARE")
 
 # Canonical role values (match seed_data / templates). Spec "administrator" == admin.
 ROLE_STUDENT = "student"
@@ -355,4 +358,10 @@ def legacy_static():
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # Bind 0.0.0.0 so Docker published ports reach the process; debug stays
+    # lab-only until a production WSGI server is adopted.
+    host = os.environ.get("FLASK_RUN_HOST", "0.0.0.0")
+    port = int(os.environ.get("FLASK_RUN_PORT", "5000"))
+    debug = os.environ.get("FLASK_DEBUG", "1") == "1"
+    app.run(host=host, port=port, debug=debug)
+

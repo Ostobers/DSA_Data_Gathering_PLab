@@ -1,3 +1,5 @@
+"""Flask app with server-side role gates for Jinja templates."""
+
 from functools import wraps
 
 from flask import (
@@ -18,9 +20,15 @@ from seed_data import ALERTS, STUDENTS, USERS, alerts_for, dashboard_totals, stu
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "DONOTSHARE"
 
-STUDENT_ROLES = ("student", "admin")
-FACULTY_ROLES = ("faculty", "admin")
-ADMIN_ROLES = ("admin",)
+# Canonical role values (match seed_data / templates). Spec "administrator" == admin.
+ROLE_STUDENT = "student"
+ROLE_FACULTY = "faculty"
+ROLE_ADMIN = "admin"
+ALL_ROLES = (ROLE_STUDENT, ROLE_FACULTY, ROLE_ADMIN)
+
+STUDENT_ROLES = (ROLE_STUDENT, ROLE_ADMIN)
+FACULTY_ROLES = (ROLE_FACULTY, ROLE_ADMIN)
+ADMIN_ROLES = (ROLE_ADMIN,)
 
 
 class LoginForm(FlaskForm):
@@ -66,12 +74,20 @@ def login_required(view):
     return wrapped
 
 
-def roles_required(*roles):
+def require_roles(*roles):
+    """Redirect unsigned users to login; render forbidden for wrong role."""
+
     def decorator(view):
         @wraps(view)
-        @login_required
         def wrapped(*args, **kwargs):
             user = current_user()
+            if not user:
+                flash("Log in to continue.", "error")
+                return redirect(url_for("login", next=request.path))
+            if user["status"] != "active":
+                session.clear()
+                flash("This account is disabled.", "error")
+                return redirect(url_for("login"))
             if user["role"] not in roles:
                 return render_template("forbidden.html"), 403
             return view(*args, **kwargs)
@@ -82,9 +98,9 @@ def roles_required(*roles):
 
 
 def home_for(user):
-    if user["role"] == "faculty":
+    if user["role"] == ROLE_FACULTY:
         return url_for("faculty_home")
-    if user["role"] == "admin":
+    if user["role"] == ROLE_ADMIN:
         return url_for("admin_home")
     return url_for("student_home")
 
@@ -107,7 +123,7 @@ def admin_users_redirect():
 
 
 @app.route("/home")
-@login_required
+@require_roles(*ALL_ROLES)
 def home_redirect():
     """Compatibility redirect to the role-appropriate dashboard."""
     return redirect(home_for(current_user()))
@@ -143,6 +159,7 @@ def logout():
 
 
 @app.route("/register")
+@require_roles(ROLE_ADMIN)
 def register():
     return render_template("register.html")
 
@@ -160,8 +177,14 @@ def recover_sent():
     return render_template("recover_sent.html")
 
 
+@app.route("/forbidden")
+@require_roles(*ALL_ROLES)
+def forbidden():
+    return render_template("forbidden.html"), 403
+
+
 @app.route("/profile", methods=["GET", "POST"])
-@login_required
+@require_roles(*ALL_ROLES)
 def profile():
     user = current_user()
     if request.method == "POST":
@@ -188,11 +211,11 @@ def profile():
 
 
 @app.route("/student")
-@roles_required(*STUDENT_ROLES)
+@require_roles(*STUDENT_ROLES)
 def student_home():
     user = current_user()
     student = student_by_id(user.get("student_id")) if user.get("student_id") else None
-    if student is None and user["role"] == "admin":
+    if student is None and user["role"] == ROLE_ADMIN:
         student = STUDENTS[3]
     if student is None:
         return render_template("forbidden.html"), 403
@@ -200,11 +223,11 @@ def student_home():
 
 
 @app.route("/history")
-@roles_required(*STUDENT_ROLES)
+@require_roles(*STUDENT_ROLES)
 def history():
     user = current_user()
     student = student_by_id(user.get("student_id")) if user.get("student_id") else None
-    if student is None and user["role"] == "admin":
+    if student is None and user["role"] == ROLE_ADMIN:
         student = STUDENTS[3]
     if student is None:
         return render_template("forbidden.html"), 403
@@ -212,7 +235,7 @@ def history():
 
 
 @app.route("/faculty")
-@roles_required(*FACULTY_ROLES)
+@require_roles(*FACULTY_ROLES)
 def faculty_home():
     q = request.args.get("q", "").strip().lower()
     population = request.args.get("population", "")
@@ -254,7 +277,7 @@ def faculty_home():
 
 
 @app.route("/faculty/students/<student_id>")
-@roles_required(*FACULTY_ROLES)
+@require_roles(*FACULTY_ROLES)
 def student_detail(student_id):
     student = student_by_id(student_id)
     if student is None:
@@ -267,7 +290,7 @@ def student_detail(student_id):
 
 
 @app.route("/faculty/alerts/<alert_id>/review", methods=["POST"])
-@roles_required(*FACULTY_ROLES)
+@require_roles(*FACULTY_ROLES)
 def review_alert(alert_id):
     for alert in ALERTS:
         if alert["id"] == alert_id:
@@ -278,7 +301,7 @@ def review_alert(alert_id):
 
 
 @app.route("/admin")
-@roles_required(*ADMIN_ROLES)
+@require_roles(*ADMIN_ROLES)
 def admin_home():
     return render_template(
         "admin_home.html",
@@ -288,7 +311,7 @@ def admin_home():
 
 
 @app.route("/users", methods=["GET", "POST"])
-@roles_required(*ADMIN_ROLES)
+@require_roles(*ADMIN_ROLES)
 def users():
     if request.method == "POST":
         action = request.form.get("action")
@@ -304,7 +327,7 @@ def users():
                     "password": "demo",
                     "name": (request.form.get("name") or username).strip(),
                     "email": (request.form.get("email") or "").strip(),
-                    "role": request.form.get("role") or "student",
+                    "role": request.form.get("role") or ROLE_STUDENT,
                     "status": "active",
                     "population": "Created in prototype",
                     "student_id": None,
@@ -330,14 +353,14 @@ def survey_page(template, **kwargs):
 # Prefer clean paths for url_for (first-registered rule wins). Keep .html aliases.
 @app.route("/surveys/index.html")
 @app.route("/surveys")
-@roles_required(*STUDENT_ROLES)
+@require_roles(*STUDENT_ROLES)
 def surveys():
     return survey_page("surveys.html")
 
 
 @app.route("/applicant.html")
 @app.route("/applicant")
-@roles_required(*STUDENT_ROLES)
+@require_roles(*STUDENT_ROLES)
 def applicant():
     return survey_page(
         "survey_form.html",
@@ -348,7 +371,7 @@ def applicant():
 
 @app.route("/current-student.html")
 @app.route("/current-student")
-@roles_required(*STUDENT_ROLES)
+@require_roles(*STUDENT_ROLES)
 def current_student():
     return survey_page(
         "survey_form.html",
@@ -359,7 +382,7 @@ def current_student():
 
 @app.route("/near-graduation.html")
 @app.route("/near-graduation")
-@roles_required(*STUDENT_ROLES)
+@require_roles(*STUDENT_ROLES)
 def near_graduation():
     return survey_page(
         "survey_form.html",
@@ -370,7 +393,7 @@ def near_graduation():
 
 @app.route("/after-graduation.html")
 @app.route("/after-graduation")
-@roles_required(*STUDENT_ROLES)
+@require_roles(*STUDENT_ROLES)
 def after_graduation():
     return survey_page(
         "survey_form.html",

@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{ title }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body data-survey="{{ survey_key }}">
+<nav aria-label="Survey navigation">
+  <a href="{{ url_for('surveys') }}">Survey home</a>
+  <a href="{{ url_for('applicant') }}" {% if survey_key == 'applicant' %}aria-current="page"{% endif %}>Applicant</a>
+  <a href="{{ url_for('current_student') }}" {% if survey_key == 'current' %}aria-current="page"{% endif %}>Current Student</a>
+  <a href="{{ url_for('near_graduation') }}" {% if survey_key == 'near' %}aria-current="page"{% endif %}>Near Graduation</a>
+  <a href="{{ url_for('after_graduation') }}" {% if survey_key == 'after' %}aria-current="page"{% endif %}>After Graduation</a>
+  {% if user and user.role == 'admin' %}
+    <a href="{{ url_for('admin_home') }}">Admin dashboard</a>
+  {% else %}
+    <a href="{{ url_for('student_home') }}">My dashboard</a>
+  {% endif %}
+</nav>
+<div id="app"></div>
+<script src="{{ url_for('static', filename='js/surveys.js') }}"></script>
+<script src="{{ url_for('static', filename='js/survey.js') }}"></script>
+</body>
+</html>

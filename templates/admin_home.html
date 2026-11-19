@@ -22,5 +22,13 @@
     <p>Administrators can open the same dashboard faculty use in advising meetings.</p>
     <p><a class="btn ghost" href="{{ url_for('faculty_home') }}">Open faculty dashboard</a></p>
   </article>
+  <article class="card">
+    <h2>Student view and forms</h2>
+    <p>Administrators can open the student dashboard and every survey form.</p>
+    <p>
+      <a class="btn ghost" href="{{ url_for('student_home') }}">Open student dashboard</a>
+      <a class="btn ghost" href="{{ url_for('surveys') }}">Open surveys</a>
+    </p>
+  </article>
 </div>
 {% endblock %}

@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DSA MS Student Success Surveys</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+<nav aria-label="Survey navigation">
+  <a href="{{ url_for('index') }}">Site home</a>
+  <a href="{{ url_for('surveys') }}" aria-current="page">Survey home</a>
+  <a href="{{ url_for('applicant') }}">Applicant</a>
+  <a href="{{ url_for('current_student') }}">Current Student</a>
+  <a href="{{ url_for('near_graduation') }}">Near Graduation</a>
+  <a href="{{ url_for('after_graduation') }}">After Graduation</a>
+  {% if user and user.role == 'admin' %}
+    <a href="{{ url_for('admin_home') }}">Admin dashboard</a>
+  {% else %}
+    <a href="{{ url_for('student_home') }}">My dashboard</a>
+  {% endif %}
+  <a href="{{ url_for('profile') }}">Profile</a>
+  <a href="{{ url_for('logout') }}">Log out</a>
+</nav>
+<h1>DSA MS Student Success Surveys</h1>
+<p>Prototype. Current students can complete a recurring check-in or choose a short or expanded milestone survey. Responses are <strong>not saved</strong>.</p>
+<ul>
+  <li><a href="{{ url_for('applicant') }}">Applicant Survey</a></li>
+  <li><a href="{{ url_for('current_student') }}">Current Student Surveys</a></li>
+  <li><a href="{{ url_for('near_graduation') }}">Near Graduation Survey</a></li>
+  <li><a href="{{ url_for('after_graduation') }}">After Graduation Survey</a></li>
+</ul>
+</body>
+</html>

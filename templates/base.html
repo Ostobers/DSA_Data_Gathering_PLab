@@ -20,10 +20,14 @@
           {% if user.role == 'student' %}
             <a href="{{ url_for('student_home') }}" {% if request.endpoint == 'student_home' %}aria-current="page"{% endif %}>My dashboard</a>
             <a href="{{ url_for('history') }}" {% if request.endpoint == 'history' %}aria-current="page"{% endif %}>Check-in history</a>
+            <a href="{{ url_for('surveys') }}">Surveys</a>
           {% elif user.role == 'faculty' %}
             <a href="{{ url_for('faculty_home') }}" {% if request.endpoint == 'faculty_home' %}aria-current="page"{% endif %}>Faculty dashboard</a>
           {% elif user.role == 'admin' %}
             <a href="{{ url_for('admin_home') }}" {% if request.endpoint == 'admin_home' %}aria-current="page"{% endif %}>Admin dashboard</a>
+            <a href="{{ url_for('faculty_home') }}" {% if request.endpoint == 'faculty_home' %}aria-current="page"{% endif %}>Faculty dashboard</a>
+            <a href="{{ url_for('student_home') }}" {% if request.endpoint == 'student_home' %}aria-current="page"{% endif %}>Student dashboard</a>
+            <a href="{{ url_for('surveys') }}">Surveys</a>
             <a href="{{ url_for('users') }}" {% if request.endpoint == 'users' %}aria-current="page"{% endif %}>Accounts</a>
           {% endif %}
           <a href="{{ url_for('profile') }}" {% if request.endpoint == 'profile' %}aria-current="page"{% endif %}>Profile</a>

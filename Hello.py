@@ -2,12 +2,20 @@
 
 from functools import wraps
 
-from flask import Flask, flash, redirect, render_template, request, send_from_directory, session, url_for
+from flask import (
+    Flask,
+    flash,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 from flask_wtf import FlaskForm
 from wtforms import PasswordField, StringField, SubmitField
 from wtforms.validators import InputRequired, Length
 
-import seed_data
+from seed_data import ALERTS, STUDENTS, USERS, alerts_for, dashboard_totals, student_by_id
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "DONOTSHARE"
@@ -18,7 +26,9 @@ ROLE_FACULTY = "faculty"
 ROLE_ADMIN = "admin"
 ALL_ROLES = (ROLE_STUDENT, ROLE_FACULTY, ROLE_ADMIN)
 
-ACCOUNTS = {key: dict(value) for key, value in seed_data.USERS.items()}
+STUDENT_ROLES = (ROLE_STUDENT, ROLE_ADMIN)
+FACULTY_ROLES = (ROLE_FACULTY, ROLE_ADMIN)
+ADMIN_ROLES = (ROLE_ADMIN,)
 
 
 class LoginForm(FlaskForm):
@@ -35,8 +45,8 @@ class LoginForm(FlaskForm):
 
 class RecoverForm(FlaskForm):
     email = StringField(
-        validators=[InputRequired(), Length(max=120)],
-        render_kw={"placeholder": "you@buffalostate.edu"},
+        validators=[InputRequired(), Length(min=5, max=80)],
+        render_kw={"placeholder": "Email"},
     )
     submit = SubmitField("Send recovery instructions")
 
@@ -45,12 +55,23 @@ def current_user():
     username = session.get("username")
     if not username:
         return None
-    return ACCOUNTS.get(username)
+    return USERS.get(username)
 
 
 @app.context_processor
 def inject_user():
     return {"user": current_user()}
+
+
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not current_user():
+            flash("Please log in to continue.", "error")
+            return redirect(url_for("login", next=request.path))
+        return view(*args, **kwargs)
+
+    return wrapped
 
 
 def require_roles(*roles):
@@ -62,7 +83,7 @@ def require_roles(*roles):
             user = current_user()
             if not user:
                 flash("Log in to continue.", "error")
-                return redirect(url_for("login"))
+                return redirect(url_for("login", next=request.path))
             if user["status"] != "active":
                 session.clear()
                 flash("This account is disabled.", "error")
@@ -76,60 +97,71 @@ def require_roles(*roles):
     return decorator
 
 
-def student_record_for(user):
-    if user.get("student_id"):
-        found = seed_data.student_by_id(user["student_id"])
-        if found:
-            return found
-    return {
-        "id": "—",
-        "name": user["name"],
-        "population": user.get("population", "Student / User"),
-        "term": "—",
-        "gaps": "None reported",
-        "confidence": None,
-        "belonging": None,
-        "workload": None,
-        "financial": None,
-        "job": None,
-        "job_stage": "—",
-        "advising": False,
-        "latest_checkin": None,
-        "checkins": [],
-    }
+def home_for(user):
+    if user["role"] == ROLE_FACULTY:
+        return url_for("faculty_home")
+    if user["role"] == ROLE_ADMIN:
+        return url_for("admin_home")
+    return url_for("student_home")
 
 
-def visible_alerts():
-    reviewed = set(session.get("reviewed_alerts", []))
-    rows = []
-    for alert in seed_data.ALERTS:
-        item = dict(alert)
-        if item["id"] in reviewed:
-            item["status"] = "reviewed"
-        rows.append(item)
-    return rows
+@app.route("/")
+def index():
+    return render_template("index.html")
 
 
-# --- Public (no role gate) ---
+@app.route("/dashboard")
+def dashboard_redirect():
+    """Compatibility redirect from former student home path."""
+    return redirect(url_for("student_home"))
+
+
+@app.route("/admin/users")
+def admin_users_redirect():
+    """Compatibility redirect from former admin accounts path."""
+    return redirect(url_for("users"))
+
+
+@app.route("/home")
+@require_roles(*ALL_ROLES)
+def home_redirect():
+    """Compatibility redirect to the role-appropriate dashboard."""
+    return redirect(home_for(current_user()))
 
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if current_user():
-        return redirect(url_for("home_for_role"))
+        return redirect(home_for(current_user()))
+
     form = LoginForm()
     if form.validate_on_submit():
-        account = ACCOUNTS.get(form.username.data)
-        if not account or account["password"] != form.password.data:
-            flash("Username or password is not correct.", "error")
-            return render_template("login.html", form=form)
-        if account["status"] != "active":
-            flash("This account is disabled. Ask an administrator for help.", "error")
-            return render_template("login.html", form=form)
-        session["username"] = account["username"]
-        flash("Signed in as %s." % account["name"])
-        return redirect(url_for("home_for_role"))
+        account = USERS.get(form.username.data)
+        if (
+            account
+            and account["status"] == "active"
+            and account["password"] == form.password.data
+        ):
+            session["username"] = account["username"]
+            nxt = request.args.get("next")
+            if nxt and nxt.startswith("/"):
+                return redirect(nxt)
+            return redirect(home_for(account))
+        flash("Invalid username or password.", "error")
     return render_template("login.html", form=form)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    flash("You have been logged out.")
+    return redirect(url_for("index"))
+
+
+@app.route("/register")
+@require_roles(ROLE_ADMIN)
+def register():
+    return render_template("register.html")
 
 
 @app.route("/recover", methods=["GET", "POST"])
@@ -145,61 +177,14 @@ def recover_sent():
     return render_template("recover_sent.html")
 
 
-@app.route("/logout")
-def logout():
-    session.clear()
-    flash("You have been logged out.")
-    return redirect(url_for("login"))
-
-
-# --- Gated pages (matrix) ---
-
-
-@app.route("/")
-@require_roles(ROLE_STUDENT, ROLE_FACULTY, ROLE_ADMIN)
-def index():
-    return render_template("index.html")
-
-
-@app.route("/register")
-@require_roles(ROLE_ADMIN)
-def register():
-    return render_template("register.html")
-
-
 @app.route("/forbidden")
 @require_roles(*ALL_ROLES)
 def forbidden():
     return render_template("forbidden.html"), 403
 
 
-@app.route("/home")
-@require_roles(*ALL_ROLES)
-def home_for_role():
-    role = current_user()["role"]
-    if role == ROLE_FACULTY:
-        return redirect(url_for("faculty_home"))
-    if role == ROLE_ADMIN:
-        return redirect(url_for("admin_home"))
-    return redirect(url_for("student_home"))
-
-
-@app.route("/dashboard")
-@require_roles(ROLE_STUDENT, ROLE_ADMIN)
-def student_home():
-    user = current_user()
-    return render_template("student_home.html", student=student_record_for(user))
-
-
-@app.route("/history")
-@require_roles(ROLE_STUDENT, ROLE_FACULTY, ROLE_ADMIN)
-def history():
-    user = current_user()
-    return render_template("history.html", student=student_record_for(user))
-
-
 @app.route("/profile", methods=["GET", "POST"])
-@require_roles(ROLE_STUDENT, ROLE_FACULTY, ROLE_ADMIN)
+@require_roles(*ALL_ROLES)
 def profile():
     user = current_user()
     if request.method == "POST":
@@ -207,31 +192,55 @@ def profile():
         if action == "profile":
             user["name"] = request.form.get("name", user["name"]).strip() or user["name"]
             user["email"] = request.form.get("email", user["email"]).strip() or user["email"]
-            flash("Profile saved in this session.")
+            flash("Profile updated.")
         elif action == "password":
-            current_pw = request.form.get("current", "")
-            new_pw = request.form.get("new_password", "")
+            current = request.form.get("current", "")
+            new_password = request.form.get("new_password", "")
             confirm = request.form.get("confirm", "")
-            if current_pw != user["password"]:
-                flash("Current password is not correct.", "error")
-            elif len(new_pw) < 4:
+            if current != user["password"]:
+                flash("Current password is incorrect.", "error")
+            elif len(new_password) < 4:
                 flash("New password must be at least 4 characters.", "error")
-            elif new_pw != confirm:
-                flash("New password and confirmation do not match.", "error")
+            elif new_password != confirm:
+                flash("New passwords do not match.", "error")
             else:
-                user["password"] = new_pw
+                user["password"] = new_password
                 flash("Password updated for this demo session.")
         return redirect(url_for("profile"))
     return render_template("profile.html")
 
 
+@app.route("/student")
+@require_roles(*STUDENT_ROLES)
+def student_home():
+    user = current_user()
+    student = student_by_id(user.get("student_id")) if user.get("student_id") else None
+    if student is None and user["role"] == ROLE_ADMIN:
+        student = STUDENTS[3]
+    if student is None:
+        return render_template("forbidden.html"), 403
+    return render_template("student_home.html", student=student)
+
+
+@app.route("/history")
+@require_roles(*STUDENT_ROLES)
+def history():
+    user = current_user()
+    student = student_by_id(user.get("student_id")) if user.get("student_id") else None
+    if student is None and user["role"] == ROLE_ADMIN:
+        student = STUDENTS[3]
+    if student is None:
+        return render_template("forbidden.html"), 403
+    return render_template("history.html", student=student)
+
+
 @app.route("/faculty")
-@require_roles(ROLE_FACULTY, ROLE_ADMIN)
+@require_roles(*FACULTY_ROLES)
 def faculty_home():
     q = request.args.get("q", "").strip().lower()
     population = request.args.get("population", "")
     flag = request.args.get("flag", "")
-    students = list(seed_data.STUDENTS)
+    students = list(STUDENTS)
     if q:
         students = [s for s in students if q in s["name"].lower()]
     if population:
@@ -239,21 +248,27 @@ def faculty_home():
     if flag == "advising":
         students = [s for s in students if s["advising"]]
     elif flag == "low_confidence":
-        students = [s for s in students if s["confidence"] is not None and s["confidence"] <= 2]
+        students = [
+            s
+            for s in students
+            if s["confidence"] is not None and s["confidence"] <= 2
+        ]
     elif flag == "gaps":
         students = [s for s in students if s["gaps"] != "None reported"]
     elif flag == "job":
         students = [
             s
             for s in students
-            if s["population"] == "Current student" and s["job"] is not None and s["job"] <= 2
+            if s["population"] == "Current student"
+            and s["job"] is not None
+            and s["job"] <= 2
         ]
-    populations = sorted({s["population"] for s in seed_data.STUDENTS})
+    populations = sorted({s["population"] for s in STUDENTS})
     return render_template(
         "faculty_home.html",
+        alerts=ALERTS,
         students=students,
-        alerts=visible_alerts(),
-        totals=seed_data.dashboard_totals(),
+        totals=dashboard_totals(),
         q=request.args.get("q", ""),
         population=population,
         flag=flag,
@@ -262,96 +277,129 @@ def faculty_home():
 
 
 @app.route("/faculty/students/<student_id>")
-@require_roles(ROLE_FACULTY, ROLE_ADMIN)
+@require_roles(*FACULTY_ROLES)
 def student_detail(student_id):
-    student = seed_data.student_by_id(student_id)
-    if not student:
-        flash("Student not found.", "error")
-        return redirect(url_for("faculty_home"))
-    alerts = [a for a in visible_alerts() if a["student_id"] == student_id]
-    return render_template("student_detail.html", student=student, alerts=alerts)
+    student = student_by_id(student_id)
+    if student is None:
+        return render_template("forbidden.html"), 404
+    return render_template(
+        "student_detail.html",
+        student=student,
+        alerts=alerts_for(student_id),
+    )
 
 
 @app.route("/faculty/alerts/<alert_id>/review", methods=["POST"])
-@require_roles(ROLE_FACULTY, ROLE_ADMIN)
+@require_roles(*FACULTY_ROLES)
 def review_alert(alert_id):
-    reviewed = set(session.get("reviewed_alerts", []))
-    reviewed.add(alert_id)
-    session["reviewed_alerts"] = list(reviewed)
-    flash("Alert marked reviewed.")
+    for alert in ALERTS:
+        if alert["id"] == alert_id:
+            alert["status"] = "reviewed"
+            flash("Alert marked reviewed.")
+            break
     return redirect(url_for("faculty_home"))
 
 
 @app.route("/admin")
-@require_roles(ROLE_ADMIN)
+@require_roles(*ADMIN_ROLES)
 def admin_home():
     return render_template(
         "admin_home.html",
-        totals=seed_data.dashboard_totals(),
-        user_count=len(ACCOUNTS),
+        totals=dashboard_totals(),
+        user_count=len(USERS),
     )
 
 
-@app.route("/admin/users", methods=["GET", "POST"])
-@require_roles(ROLE_ADMIN)
+@app.route("/users", methods=["GET", "POST"])
+@require_roles(*ADMIN_ROLES)
 def users():
     if request.method == "POST":
         action = request.form.get("action")
-        username = (request.form.get("username") or "").strip()
         if action == "create":
-            if username in ACCOUNTS:
-                flash("That username already exists.", "error")
-            elif not username:
+            username = (request.form.get("username") or "").strip()
+            if not username:
                 flash("Username is required.", "error")
+            elif username in USERS:
+                flash("That username already exists.", "error")
             else:
-                ACCOUNTS[username] = {
+                USERS[username] = {
                     "username": username,
                     "password": "demo",
-                    "name": request.form.get("name", username).strip() or username,
-                    "email": request.form.get("email", "").strip(),
-                    "role": request.form.get("role", ROLE_STUDENT),
+                    "name": (request.form.get("name") or username).strip(),
+                    "email": (request.form.get("email") or "").strip(),
+                    "role": request.form.get("role") or ROLE_STUDENT,
                     "status": "active",
-                    "population": "Created by administrator",
+                    "population": "Created in prototype",
                     "student_id": None,
                 }
-                flash("Account created. Temporary password is demo.")
-        elif action in {"disable", "enable"} and username in ACCOUNTS:
-            if username == current_user()["username"] and action == "disable":
+                flash("Account created with temporary password demo.")
+        elif action in {"disable", "enable"}:
+            username = request.form.get("username")
+            account = USERS.get(username)
+            if account and account["username"] != current_user()["username"]:
+                account["status"] = "disabled" if action == "disable" else "active"
+                flash("Account updated.")
+            elif account:
                 flash("You cannot disable your own account.", "error")
-            else:
-                ACCOUNTS[username]["status"] = "disabled" if action == "disable" else "active"
-                flash("Account %s." % ("disabled" if action == "disable" else "enabled"))
         return redirect(url_for("users"))
-    accounts = sorted(ACCOUNTS.values(), key=lambda row: row["name"])
+    accounts = sorted(USERS.values(), key=lambda a: a["name"].lower())
     return render_template("users.html", accounts=accounts)
 
 
-# Serve root survey HTML/assets for template links (auth.js still gates those pages).
-@app.route("/surveys/<path:filename>")
-def static_page(filename):
-    allowed = {
-        "applicant.html",
-        "current-student.html",
-        "near-graduation.html",
-        "after-graduation.html",
-        "style.css",
-        "survey.js",
-        "surveys.js",
-    }
-    if filename not in allowed:
-        return render_template("forbidden.html"), 404
-    return send_from_directory(app.root_path, filename)
+def survey_page(template, **kwargs):
+    return render_template(template, **kwargs)
+
+
+# Prefer clean paths for url_for (first-registered rule wins). Keep .html aliases.
+@app.route("/surveys/index.html")
+@app.route("/surveys")
+@require_roles(*STUDENT_ROLES)
+def surveys():
+    return survey_page("surveys.html")
 
 
 @app.route("/applicant.html")
+@app.route("/applicant")
+@require_roles(*STUDENT_ROLES)
+def applicant():
+    return survey_page(
+        "survey_form.html",
+        title="Applicant Survey",
+        survey_key="applicant",
+    )
+
+
 @app.route("/current-student.html")
+@app.route("/current-student")
+@require_roles(*STUDENT_ROLES)
+def current_student():
+    return survey_page(
+        "survey_form.html",
+        title="Current Student Surveys",
+        survey_key="current",
+    )
+
+
 @app.route("/near-graduation.html")
+@app.route("/near-graduation")
+@require_roles(*STUDENT_ROLES)
+def near_graduation():
+    return survey_page(
+        "survey_form.html",
+        title="Near Graduation Survey",
+        survey_key="near",
+    )
+
+
 @app.route("/after-graduation.html")
-@app.route("/style.css")
-@app.route("/survey.js")
-@app.route("/surveys.js")
-def legacy_static():
-    return send_from_directory(app.root_path, request.path.lstrip("/"))
+@app.route("/after-graduation")
+@require_roles(*STUDENT_ROLES)
+def after_graduation():
+    return survey_page(
+        "survey_form.html",
+        title="After Graduation Survey",
+        survey_key="after",
+    )
 
 
 if __name__ == "__main__":

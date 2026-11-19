@@ -250,7 +250,7 @@ function done(){
  // submitted_at, form and version are included so repeated check-ins can be stored later.
  const data={survey:S.title,form:form().name,version:form().singleVersion?'single':ver,submitted_at:new Date().toISOString(),answers:collect()};
  console.log(data);
- box.innerHTML='<h2>Thank you!</h2><p>Your response was submitted. <strong>This is a prototype: responses are not saved anywhere.</strong></p><details><summary>Show the answers (for testing)</summary><pre>'+esc(JSON.stringify(data,null,2))+'</pre></details><p><button id="again" type="button">Fill out again</button></p><p><a href="index.html">Back to all surveys</a></p>';
+ box.innerHTML='<h2>Thank you!</h2><p>Your response was submitted. <strong>This is a prototype: responses are not saved anywhere.</strong></p><details><summary>Show the answers (for testing)</summary><pre>'+esc(JSON.stringify(data,null,2))+'</pre></details><p><button id="again" type="button">Fill out again</button></p><p><a href="/surveys">Back to all surveys</a></p>';
  document.getElementById('again').onclick=drawForm;
  scrollTo(0,0);
 }

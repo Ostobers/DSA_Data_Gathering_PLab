@@ -94,6 +94,25 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/dashboard")
+def dashboard_redirect():
+    """Compatibility redirect from former student home path."""
+    return redirect(url_for("student_home"))
+
+
+@app.route("/admin/users")
+def admin_users_redirect():
+    """Compatibility redirect from former admin accounts path."""
+    return redirect(url_for("users"))
+
+
+@app.route("/home")
+@login_required
+def home_redirect():
+    """Compatibility redirect to the role-appropriate dashboard."""
+    return redirect(home_for(current_user()))
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if current_user():
@@ -308,15 +327,16 @@ def survey_page(template, **kwargs):
     return render_template(template, **kwargs)
 
 
-@app.route("/surveys")
+# Prefer clean paths for url_for (first-registered rule wins). Keep .html aliases.
 @app.route("/surveys/index.html")
+@app.route("/surveys")
 @roles_required(*STUDENT_ROLES)
 def surveys():
     return survey_page("surveys.html")
 
 
-@app.route("/applicant")
 @app.route("/applicant.html")
+@app.route("/applicant")
 @roles_required(*STUDENT_ROLES)
 def applicant():
     return survey_page(
@@ -326,8 +346,8 @@ def applicant():
     )
 
 
-@app.route("/current-student")
 @app.route("/current-student.html")
+@app.route("/current-student")
 @roles_required(*STUDENT_ROLES)
 def current_student():
     return survey_page(
@@ -337,8 +357,8 @@ def current_student():
     )
 
 
-@app.route("/near-graduation")
 @app.route("/near-graduation.html")
+@app.route("/near-graduation")
 @roles_required(*STUDENT_ROLES)
 def near_graduation():
     return survey_page(
@@ -348,8 +368,8 @@ def near_graduation():
     )
 
 
-@app.route("/after-graduation")
 @app.route("/after-graduation.html")
+@app.route("/after-graduation")
 @roles_required(*STUDENT_ROLES)
 def after_graduation():
     return survey_page(

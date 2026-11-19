@@ -8,6 +8,7 @@
 </head>
 <body data-survey="{{ survey_key }}">
 <nav aria-label="Survey navigation">
+  <a href="{{ url_for('index') }}">Site home</a>
   <a href="{{ url_for('surveys') }}">Survey home</a>
   <a href="{{ url_for('applicant') }}" {% if survey_key == 'applicant' %}aria-current="page"{% endif %}>Applicant</a>
   <a href="{{ url_for('current_student') }}" {% if survey_key == 'current' %}aria-current="page"{% endif %}>Current Student</a>
@@ -18,6 +19,8 @@
   {% else %}
     <a href="{{ url_for('student_home') }}">My dashboard</a>
   {% endif %}
+  <a href="{{ url_for('profile') }}">Profile</a>
+  <a href="{{ url_for('logout') }}">Log out</a>
 </nav>
 <div id="app"></div>
 <script src="{{ url_for('static', filename='js/surveys.js') }}"></script>

@@ -8,6 +8,7 @@
 </head>
 <body>
 <nav aria-label="Survey navigation">
+  <a href="{{ url_for('index') }}">Site home</a>
   <a href="{{ url_for('surveys') }}" aria-current="page">Survey home</a>
   <a href="{{ url_for('applicant') }}">Applicant</a>
   <a href="{{ url_for('current_student') }}">Current Student</a>
@@ -18,6 +19,8 @@
   {% else %}
     <a href="{{ url_for('student_home') }}">My dashboard</a>
   {% endif %}
+  <a href="{{ url_for('profile') }}">Profile</a>
+  <a href="{{ url_for('logout') }}">Log out</a>
 </nav>
 <h1>DSA MS Student Success Surveys</h1>
 <p>Prototype. Current students can complete a recurring check-in or choose a short or expanded milestone survey. Responses are <strong>not saved</strong>.</p>

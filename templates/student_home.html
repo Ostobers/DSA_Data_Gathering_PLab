@@ -2,7 +2,7 @@
 {% block title %}My dashboard{% endblock %}
 {% block content %}
 <h1>Hello, {{ user.name }}</h1>
-<p class="note">You can see only your own records. The values below are prototype data until survey persistence is connected.</p>
+<p class="note">You can see only your own records. Values come from the latest submitted check-in when the database is connected.</p>
 
 <section class="stats">
   <div class="stat"><b class="score">{{ student.confidence or "—" }}</b><span>Confidence (1–5)</span></div>
@@ -21,7 +21,7 @@
       <p>No check-in yet.</p>
     {% endif %}
     <p><a class="btn" href="{{ url_for('current_student') }}">Choose a check-in or milestone survey</a></p>
-    <p class="note">The recurring check-in and milestone surveys are frontend prototypes and do not save responses yet.</p>
+    <p class="note">Submitted check-ins appear here and in your history after a successful save.</p>
   </article>
   <article class="card">
     <h2>My profile snapshot</h2>

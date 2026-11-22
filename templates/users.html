@@ -19,7 +19,14 @@
       <option value="faculty">Faculty adviser</option>
       <option value="admin">Program administrator</option>
     </select>
-    <p class="note">A temporary password of <code>demo</code> is assigned in this prototype.</p>
+    <label for="population">Student population</label>
+    <select id="population" name="population">
+      <option value="Current student">Current student</option>
+      <option value="Applicant">Applicant</option>
+      <option value="Graduate">Graduate</option>
+      <option value="Inactive">Inactive</option>
+    </select>
+    <p class="note">Student population is required for students; faculty/admin store <code>population</code> NULL in SQL (<code>v_accounts</code> shows display labels). Temporary password <code>demo</code> is hashed via a pluggable helper (TEMP_SHA256 until login student registers bcrypt).</p>
     <p><button type="submit" name="action" value="create">Create account</button></p>
   </form>
   <article class="card">

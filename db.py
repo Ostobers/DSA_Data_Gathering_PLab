@@ -855,6 +855,31 @@ def create_user(
     return account
 
 
+def _fetch_account_row(conn, *, username: Optional[str] = None, user_id: Optional[int] = None):
+    """Read a users row after DML (avoid UPDATE…OUTPUT — users has triggers)."""
+    if username is not None:
+        return conn.execute(
+            text(
+                """
+                SELECT id, username, name, email, role, status, population,
+                       student_id, preferred_contact
+                FROM dbo.users WHERE username = :username
+                """
+            ),
+            {"username": username},
+        ).mappings().first()
+    return conn.execute(
+        text(
+            """
+            SELECT id, username, name, email, role, status, population,
+                   student_id, preferred_contact
+            FROM dbo.users WHERE id = :user_id
+            """
+        ),
+        {"user_id": user_id},
+    ).mappings().first()
+
+
 def set_user_status(
     *,
     username: str,
@@ -868,22 +893,21 @@ def set_user_status(
         raise ValueError(f"status must be one of {sorted(ACCOUNT_STATUSES)}")
 
     with get_engine().begin() as conn:
+        # dbo.users has triggers — UPDATE…OUTPUT without INTO is rejected (SQL 334).
         result = conn.execute(
             text(
                 """
                 UPDATE dbo.users
                 SET status = :status,
                     updated_at = SYSUTCDATETIME()
-                OUTPUT INSERTED.id, INSERTED.username, INSERTED.name,
-                       INSERTED.email, INSERTED.role, INSERTED.status,
-                       INSERTED.population, INSERTED.student_id,
-                       INSERTED.preferred_contact
                 WHERE username = :username
                 """
             ),
             {"username": username, "status": status},
         )
-        row = result.mappings().first()
+        if result.rowcount == 0:
+            raise ValueError(f"user not found: {username}")
+        row = _fetch_account_row(conn, username=username)
         if not row:
             raise ValueError(f"user not found: {username}")
         action = "disable_user" if status == "disabled" else "enable_user"
@@ -919,6 +943,7 @@ def update_user_profile(
         raise ValueError("email is required")
 
     with get_engine().begin() as conn:
+        # dbo.users has triggers — UPDATE…OUTPUT without INTO is rejected (SQL 334).
         result = conn.execute(
             text(
                 """
@@ -926,16 +951,14 @@ def update_user_profile(
                 SET name = :name,
                     email = :email,
                     updated_at = SYSUTCDATETIME()
-                OUTPUT INSERTED.id, INSERTED.username, INSERTED.name,
-                       INSERTED.email, INSERTED.role, INSERTED.status,
-                       INSERTED.population, INSERTED.student_id,
-                       INSERTED.preferred_contact
                 WHERE username = :username
                 """
             ),
             {"username": username, "name": name, "email": email},
         )
-        row = result.mappings().first()
+        if result.rowcount == 0:
+            raise ValueError(f"user not found: {username}")
+        row = _fetch_account_row(conn, username=username)
         if not row:
             raise ValueError(f"user not found: {username}")
         if audit and actor_user_id is not None:
@@ -994,23 +1017,22 @@ def update_user_lifecycle(
         if user_row["role"] != "student":
             raise ValueError("lifecycle updates apply only to student accounts")
 
-        result = conn.execute(
+        # dbo.users has triggers — UPDATE…OUTPUT without INTO is rejected (SQL 334).
+        conn.execute(
             text(
                 """
                 UPDATE dbo.users
                 SET population = :population,
                     lifecycle_changed_at = SYSUTCDATETIME(),
                     updated_at = SYSUTCDATETIME()
-                OUTPUT INSERTED.id, INSERTED.username, INSERTED.name,
-                       INSERTED.email, INSERTED.role, INSERTED.status,
-                       INSERTED.population, INSERTED.student_id,
-                       INSERTED.preferred_contact
                 WHERE id = :user_id
                 """
             ),
             {"user_id": user_id, "population": population},
         )
-        row = result.mappings().one()
+        row = _fetch_account_row(conn, user_id=user_id)
+        if not row:
+            raise ValueError(f"user not found: {user_id}")
 
         # Upsert program_records in the same transaction.
         existing = conn.execute(

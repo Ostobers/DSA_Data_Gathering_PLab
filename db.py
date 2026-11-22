@@ -491,14 +491,22 @@ def map_student_dashboard_row(
 
 
 def map_active_alert_row(row: Mapping[str, Any]) -> dict[str, Any]:
-    """Map v_active_alerts to seed_data ALERTS shape used by templates."""
+    """Map v_active_alerts to seed_data ALERTS shape used by templates.
+
+    View columns (no title): alert_id, user_id, student_id, student, rule_code,
+    version_number, severity, rule_description, source_response_id, trigger_values,
+    alert_description, alert_status, created_at.
+    """
     return {
         "id": str(row.get("alert_id")),
         "student_id": row.get("student_id"),
         "student": row.get("student") or "",
-        "type": row.get("title") or row.get("alert_description") or row.get("rule_code") or "",
+        "type": row.get("alert_description")
+        or row.get("severity")
+        or row.get("rule_code")
+        or "",
         "rule": row.get("rule_description") or row.get("rule_code") or "",
-        "value": row.get("trigger_values") or row.get("alert_description") or "",
+        "value": row.get("trigger_values") or "",
         "status": row.get("alert_status") or "active",
         "user_id": _as_int_or_none(row.get("user_id")),
     }
@@ -616,7 +624,7 @@ def fetch_active_alerts(
     return fetch_all(
         f"""
         SELECT alert_id, user_id, student_id, student, rule_code, version_number,
-               title, rule_description, source_response_id, trigger_values,
+               severity, rule_description, source_response_id, trigger_values,
                alert_description, alert_status, created_at
         FROM dbo.v_active_alerts
         WHERE {where}

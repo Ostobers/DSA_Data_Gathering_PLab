@@ -70,7 +70,7 @@ class MapActiveAlertTests(unittest.TestCase):
             "student_id": "S-1004",
             "student": "Jordan Lee",
             "rule_code": "LOW_CONF",
-            "title": "Low confidence",
+            "severity": "medium",
             "rule_description": "Confidence ≤ 2",
             "trigger_values": "1",
             "alert_description": "Confidence 1",
@@ -78,10 +78,27 @@ class MapActiveAlertTests(unittest.TestCase):
         }
         mapped = db.map_active_alert_row(row)
         self.assertEqual(mapped["id"], "3")
-        self.assertEqual(mapped["type"], "Low confidence")
+        self.assertEqual(mapped["type"], "Confidence 1")
         self.assertEqual(mapped["rule"], "Confidence ≤ 2")
         self.assertEqual(mapped["value"], "1")
         self.assertEqual(mapped["status"], "active")
+
+    def test_maps_type_from_severity_when_description_missing(self):
+        row = {
+            "alert_id": 4,
+            "student_id": "S-1004",
+            "student": "Jordan Lee",
+            "rule_code": "LOW_CONF",
+            "severity": "high",
+            "rule_description": "Confidence ≤ 2",
+            "trigger_values": None,
+            "alert_description": None,
+            "alert_status": "active",
+        }
+        mapped = db.map_active_alert_row(row)
+        self.assertEqual(mapped["type"], "high")
+        self.assertEqual(mapped["value"], "")
+        self.assertEqual(mapped["rule"], "Confidence ≤ 2")
 
 
 class TotalsShapeTests(unittest.TestCase):

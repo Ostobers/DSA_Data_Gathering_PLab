@@ -1,7 +1,8 @@
 """Thin SQL Server data-access helpers for Flask routing.
 
-Uses MSSQL_* compose env vars and ODBC Driver 18. Keep seed_data as the
-UX fallback until later phases migrate reads (USE_SEED_DATA flag).
+Uses MSSQL_* compose env vars and ODBC Driver 18. Phase D view helpers
+prefer SQL when connected; USE_SEED_DATA still allows seed_data fallback
+when SQL is unavailable or empty.
 """
 
 from __future__ import annotations
@@ -14,7 +15,8 @@ from typing import Any, Callable, Mapping, Optional
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, Result
 
-# Until Phase D+ replace dashboard reads, keep in-memory seed_data available.
+# When True, allow in-memory seed_data fallback if SQL is unavailable or empty.
+# Prefer SQL view reads whenever the engine connects successfully.
 USE_SEED_DATA = os.environ.get("USE_SEED_DATA", "1") == "1"
 
 _engine: Optional[Engine] = None
@@ -272,6 +274,283 @@ def fetch_latest_draft(
 def canonical_answers_json(answers: Mapping[str, Any]) -> str:
     """Stable JSON used for proc writes and identical-retry idempotency."""
     return json.dumps(answers, ensure_ascii=False, separators=(",", ":"))
+
+
+# ---------------------------------------------------------------------------
+# Phase D — view helpers (faculty / student / admin reads)
+# ---------------------------------------------------------------------------
+
+
+def sql_configured() -> bool:
+    """True when MSSQL credentials are present (compose/.env)."""
+    return bool(os.environ.get("MSSQL_USER") and os.environ.get("MSSQL_PASSWORD"))
+
+
+def _iso_date(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        # datetime → date portion for template display
+        if hasattr(value, "hour"):
+            return value.date().isoformat()
+        return value.isoformat()
+    text_value = str(value).strip()
+    return text_value[:10] if text_value else None
+
+
+def _as_bool(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def _as_int_or_none(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def map_checkin_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Map v_checkin_history / v_latest_checkin columns to template check-in dict."""
+    return {
+        "date": _iso_date(row.get("date")),
+        "confidence": _as_int_or_none(row.get("confidence")),
+        "belonging": _as_int_or_none(row.get("belonging")),
+        "satisfaction": _as_int_or_none(row.get("satisfaction")),
+        "workload": _as_int_or_none(row.get("workload")),
+        "financial": _as_int_or_none(row.get("financial")),
+        "job": _as_int_or_none(row.get("job")),
+        "job_stage": row.get("job_stage") or "—",
+        "advising": _as_bool(row.get("advising")),
+        "comment": row.get("comment") or "",
+        "response_id": row.get("response_id"),
+        "user_id": row.get("user_id"),
+        "term_id": row.get("term_id"),
+    }
+
+
+def map_student_dashboard_row(
+    row: Mapping[str, Any],
+    *,
+    checkins: Optional[list[Mapping[str, Any]]] = None,
+) -> dict[str, Any]:
+    """Map v_student_dashboard (+ optional history) to seed_data student shape."""
+    term = None
+    if row.get("expected_graduation"):
+        term = str(row["expected_graduation"])
+    elif row.get("entry_term_id") is not None:
+        term = f"Term {row['entry_term_id']}"
+    else:
+        term = "—"
+    # Gaps live in applicant survey answers, not the dashboard view yet.
+    gaps = "None reported"
+    checkin_rows = [map_checkin_row(c) for c in (checkins or [])]
+    latest = _iso_date(row.get("latest_checkin"))
+    if latest is None and checkin_rows:
+        latest = checkin_rows[0].get("date")
+    return {
+        "id": row.get("student_id") or f"U-{row.get('user_id')}",
+        "user_id": _as_int_or_none(row.get("user_id")),
+        "name": row.get("name") or "",
+        "email": row.get("email") or "",
+        "population": row.get("population") or "",
+        "status": row.get("status") or "",
+        "term": term,
+        "gaps": gaps,
+        "confidence": _as_int_or_none(row.get("confidence")),
+        "belonging": _as_int_or_none(row.get("belonging")),
+        "workload": _as_int_or_none(row.get("workload")),
+        "financial": _as_int_or_none(row.get("financial")),
+        "job": _as_int_or_none(row.get("job")),
+        "job_stage": row.get("job_stage") or "—",
+        "advising": _as_bool(row.get("advising")),
+        "latest_checkin": latest,
+        "active_alerts": _as_int_or_none(row.get("active_alerts")) or 0,
+        "checkins": checkin_rows,
+    }
+
+
+def map_active_alert_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Map v_active_alerts to seed_data ALERTS shape used by templates."""
+    return {
+        "id": str(row.get("alert_id")),
+        "student_id": row.get("student_id"),
+        "student": row.get("student") or "",
+        "type": row.get("title") or row.get("alert_description") or row.get("rule_code") or "",
+        "rule": row.get("rule_description") or row.get("rule_code") or "",
+        "value": row.get("trigger_values") or row.get("alert_description") or "",
+        "status": row.get("alert_status") or "active",
+        "user_id": _as_int_or_none(row.get("user_id")),
+    }
+
+
+def fetch_student_dashboard_by_user_id(user_id: int) -> Optional[dict[str, Any]]:
+    return fetch_one(
+        """
+        SELECT user_id, student_id, name, email, population, status,
+               entry_term_id, expected_graduation, graduation_date,
+               latest_checkin, confidence, belonging, satisfaction,
+               workload, financial, job, job_stage, advising, active_alerts
+        FROM dbo.v_student_dashboard
+        WHERE user_id = :user_id
+        """,
+        {"user_id": user_id},
+    )
+
+
+def fetch_student_dashboard_by_student_id(student_id: str) -> Optional[dict[str, Any]]:
+    return fetch_one(
+        """
+        SELECT user_id, student_id, name, email, population, status,
+               entry_term_id, expected_graduation, graduation_date,
+               latest_checkin, confidence, belonging, satisfaction,
+               workload, financial, job, job_stage, advising, active_alerts
+        FROM dbo.v_student_dashboard
+        WHERE student_id = :student_id
+        """,
+        {"student_id": student_id},
+    )
+
+
+def fetch_latest_checkin(user_id: int) -> Optional[dict[str, Any]]:
+    return fetch_one(
+        """
+        SELECT response_id, user_id, term_id, date, confidence, belonging,
+               satisfaction, workload, financial, job, job_stage, advising, comment
+        FROM dbo.v_latest_checkin
+        WHERE user_id = :user_id
+        """,
+        {"user_id": user_id},
+    )
+
+
+def fetch_checkin_history(user_id: int) -> list[dict[str, Any]]:
+    return fetch_all(
+        """
+        SELECT response_id, user_id, term_id, date, confidence, belonging,
+               satisfaction, workload, financial, job, job_stage, advising, comment
+        FROM dbo.v_checkin_history
+        WHERE user_id = :user_id
+        ORDER BY date DESC, response_id DESC
+        """,
+        {"user_id": user_id},
+    )
+
+
+def fetch_current_collection() -> list[dict[str, Any]]:
+    """Active Current-student rows (v_current_collection)."""
+    return fetch_all(
+        """
+        SELECT user_id, student_id, name, email, population, status,
+               entry_term_id, expected_graduation, graduation_date,
+               latest_checkin, confidence, belonging, satisfaction,
+               workload, financial, job, job_stage, advising, active_alerts
+        FROM dbo.v_current_collection
+        ORDER BY name
+        """
+    )
+
+
+def fetch_student_dashboard_rows(
+    *,
+    population: Optional[str] = None,
+    active_only: bool = True,
+) -> list[dict[str, Any]]:
+    """Faculty list source: v_student_dashboard with optional population filter."""
+    clauses = ["1=1"]
+    params: dict[str, Any] = {}
+    if active_only:
+        clauses.append("status = 'active'")
+    if population:
+        clauses.append("population = :population")
+        params["population"] = population
+    where = " AND ".join(clauses)
+    return fetch_all(
+        f"""
+        SELECT user_id, student_id, name, email, population, status,
+               entry_term_id, expected_graduation, graduation_date,
+               latest_checkin, confidence, belonging, satisfaction,
+               workload, financial, job, job_stage, advising, active_alerts
+        FROM dbo.v_student_dashboard
+        WHERE {where}
+        ORDER BY name
+        """,
+        params,
+    )
+
+
+def fetch_active_alerts(
+    *,
+    user_id: Optional[int] = None,
+    student_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    clauses = ["1=1"]
+    params: dict[str, Any] = {}
+    if user_id is not None:
+        clauses.append("user_id = :user_id")
+        params["user_id"] = user_id
+    if student_id is not None:
+        clauses.append("student_id = :student_id")
+        params["student_id"] = student_id
+    where = " AND ".join(clauses)
+    return fetch_all(
+        f"""
+        SELECT alert_id, user_id, student_id, student, rule_code, version_number,
+               title, rule_description, source_response_id, trigger_values,
+               alert_description, alert_status, created_at
+        FROM dbo.v_active_alerts
+        WHERE {where}
+        ORDER BY created_at DESC, alert_id DESC
+        """,
+        params,
+    )
+
+
+def fetch_account_count() -> int:
+    row = fetch_one("SELECT COUNT(*) AS n FROM dbo.v_accounts")
+    return int(row["n"]) if row else 0
+
+
+def fetch_dashboard_totals_from_views() -> dict[str, int]:
+    """Aggregate counts for faculty/admin dashboards from SQL views."""
+    people = fetch_one(
+        "SELECT COUNT(*) AS n FROM dbo.v_student_dashboard"
+    )
+    current = fetch_one(
+        "SELECT COUNT(*) AS n FROM dbo.v_current_collection"
+    )
+    alerts = fetch_one(
+        "SELECT COUNT(*) AS n FROM dbo.v_active_alerts"
+    )
+    advising = fetch_one(
+        """
+        SELECT COUNT(*) AS n FROM dbo.v_current_collection
+        WHERE advising = 1
+        """
+    )
+    low_conf = fetch_one(
+        """
+        SELECT COUNT(*) AS n FROM dbo.v_current_collection
+        WHERE confidence IS NOT NULL AND confidence <= 2
+        """
+    )
+    # Prerequisite gaps are not on the dashboard views yet (applicant answers).
+    gaps = 0
+    return {
+        "people": int(people["n"]) if people else 0,
+        "current": int(current["n"]) if current else 0,
+        "alerts": int(alerts["n"]) if alerts else 0,
+        "advising": int(advising["n"]) if advising else 0,
+        "low_confidence": int(low_conf["n"]) if low_conf else 0,
+        "gaps": gaps,
+    }
 
 
 def save_survey_response(

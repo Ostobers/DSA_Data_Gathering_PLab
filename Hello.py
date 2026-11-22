@@ -135,6 +135,136 @@ def home_for(user):
     return url_for("student_home")
 
 
+def _try_sql(loader):
+    """Run a SQL loader; return None on connection/query failure."""
+    if not db.sql_configured():
+        return None
+    try:
+        return loader()
+    except (RuntimeError, SQLAlchemyError, DBAPIError):
+        app.logger.exception("SQL view read failed; considering seed fallback")
+        return None
+
+
+def _use_sql_result(sql_value):
+    """Prefer non-empty SQL; allow empty SQL only when seed fallback is off."""
+    if sql_value is None:
+        return False
+    if isinstance(sql_value, (list, tuple, dict)) and len(sql_value) == 0:
+        return not db.USE_SEED_DATA
+    if isinstance(sql_value, int) and sql_value == 0:
+        return not db.USE_SEED_DATA
+    return True
+
+
+def _student_from_sql_user_id(user_id, *, with_history=False):
+    row = _try_sql(lambda: db.fetch_student_dashboard_by_user_id(user_id))
+    if not row:
+        return None
+    checkins = None
+    if with_history:
+        history = _try_sql(lambda: db.fetch_checkin_history(user_id))
+        checkins = history if history is not None else []
+    return db.map_student_dashboard_row(row, checkins=checkins)
+
+
+def _student_from_sql_student_id(student_id, *, with_history=False):
+    row = _try_sql(lambda: db.fetch_student_dashboard_by_student_id(student_id))
+    if not row:
+        return None
+    checkins = None
+    if with_history:
+        uid = row.get("user_id")
+        history = _try_sql(lambda: db.fetch_checkin_history(int(uid))) if uid else []
+        checkins = history if history is not None else []
+    return db.map_student_dashboard_row(row, checkins=checkins)
+
+
+def _resolve_student_for_session(user, *, with_history=False):
+    """D1/D2: prefer v_student_dashboard / history for session actor; seed fallback."""
+    actor_id = actor_user_id()
+    if actor_id is not None:
+        student = _student_from_sql_user_id(actor_id, with_history=with_history)
+        if student is not None:
+            return student
+
+    seed_id = user.get("student_id")
+    if seed_id and db.USE_SEED_DATA:
+        student = student_by_id(seed_id)
+        if student is not None:
+            return student
+    if user["role"] == ROLE_ADMIN and db.USE_SEED_DATA:
+        return STUDENTS[3]
+    return None
+
+
+def _filter_faculty_students(students, q, population, flag):
+    """Apply faculty_home filters (shared by SQL-mapped and seed rows)."""
+    rows = list(students)
+    if q:
+        q_lower = q.lower()
+        rows = [s for s in rows if q_lower in (s.get("name") or "").lower()]
+    if population:
+        rows = [s for s in rows if s.get("population") == population]
+    if flag == "advising":
+        rows = [s for s in rows if s.get("advising")]
+    elif flag == "low_confidence":
+        rows = [
+            s
+            for s in rows
+            if s.get("confidence") is not None and s["confidence"] <= 2
+        ]
+    elif flag == "gaps":
+        rows = [s for s in rows if s.get("gaps") and s["gaps"] != "None reported"]
+    elif flag == "job":
+        rows = [
+            s
+            for s in rows
+            if s.get("population") == "Current student"
+            and s.get("job") is not None
+            and s["job"] <= 2
+        ]
+    return rows
+
+
+def _faculty_students_from_sql(population):
+    """D3: v_current_collection by default; v_student_dashboard when filtering pop."""
+    if population and population != "Current student":
+        rows = _try_sql(
+            lambda: db.fetch_student_dashboard_rows(population=population)
+        )
+    elif population == "Current student":
+        rows = _try_sql(db.fetch_current_collection)
+    else:
+        # All populations: full dashboard (superset of current collection).
+        rows = _try_sql(lambda: db.fetch_student_dashboard_rows(population=None))
+        if rows is None:
+            return None
+        if len(rows) == 0:
+            # Empty lab: try current collection specifically.
+            rows = _try_sql(db.fetch_current_collection) or []
+    if rows is None:
+        return None
+    return [db.map_student_dashboard_row(r) for r in rows]
+
+
+def _active_alerts_from_sql(*, user_id=None, student_id=None):
+    rows = _try_sql(
+        lambda: db.fetch_active_alerts(user_id=user_id, student_id=student_id)
+    )
+    if rows is None:
+        return None
+    return [db.map_active_alert_row(r) for r in rows]
+
+
+def _totals_from_sql():
+    return _try_sql(db.fetch_dashboard_totals_from_views)
+
+
+def _account_count_from_sql():
+    return _try_sql(db.fetch_account_count)
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -243,10 +373,8 @@ def profile():
 @app.route("/student")
 @require_roles(*STUDENT_ROLES)
 def student_home():
-    user = current_user()
-    student = student_by_id(user.get("student_id")) if user.get("student_id") else None
-    if student is None and user["role"] == ROLE_ADMIN:
-        student = STUDENTS[3]
+    # D1: v_latest_checkin / v_student_dashboard for session user.
+    student = _resolve_student_for_session(current_user(), with_history=False)
     if student is None:
         return render_template("forbidden.html"), 403
     return render_template("student_home.html", student=student)
@@ -255,10 +383,8 @@ def student_home():
 @app.route("/history")
 @require_roles(*STUDENT_ROLES)
 def history():
-    user = current_user()
-    student = student_by_id(user.get("student_id")) if user.get("student_id") else None
-    if student is None and user["role"] == ROLE_ADMIN:
-        student = STUDENTS[3]
+    # D2: v_checkin_history for session user.
+    student = _resolve_student_for_session(current_user(), with_history=True)
     if student is None:
         return render_template("forbidden.html"), 403
     return render_template("history.html", student=student)
@@ -267,38 +393,61 @@ def history():
 @app.route("/faculty")
 @require_roles(*FACULTY_ROLES)
 def faculty_home():
-    q = request.args.get("q", "").strip().lower()
+    # D3 + D5: v_current_collection / dashboard filters + view aggregates.
+    q = request.args.get("q", "").strip()
     population = request.args.get("population", "")
     flag = request.args.get("flag", "")
-    students = list(STUDENTS)
-    if q:
-        students = [s for s in students if q in s["name"].lower()]
-    if population:
-        students = [s for s in students if s["population"] == population]
-    if flag == "advising":
-        students = [s for s in students if s["advising"]]
-    elif flag == "low_confidence":
-        students = [
-            s
-            for s in students
-            if s["confidence"] is not None and s["confidence"] <= 2
-        ]
-    elif flag == "gaps":
-        students = [s for s in students if s["gaps"] != "None reported"]
-    elif flag == "job":
-        students = [
-            s
-            for s in students
-            if s["population"] == "Current student"
-            and s["job"] is not None
-            and s["job"] <= 2
-        ]
-    populations = sorted({s["population"] for s in STUDENTS})
+
+    sql_students = _faculty_students_from_sql(population or None)
+    if _use_sql_result(sql_students):
+        # Population already applied in SQL when set.
+        students = _filter_faculty_students(sql_students, q, "", flag)
+        pop_rows = _try_sql(lambda: db.fetch_student_dashboard_rows())
+        if pop_rows:
+            populations = sorted(
+                {r["population"] for r in pop_rows if r.get("population")}
+            )
+        else:
+            populations = sorted(
+                {s["population"] for s in sql_students if s.get("population")}
+            ) or ["Current student"]
+    elif db.USE_SEED_DATA:
+        students = _filter_faculty_students(STUDENTS, q, population, flag)
+        populations = sorted({s["population"] for s in STUDENTS})
+    else:
+        students = []
+        populations = ["Current student"]
+
+    sql_alerts = _active_alerts_from_sql()
+    if _use_sql_result(sql_alerts):
+        alerts = sql_alerts
+    elif db.USE_SEED_DATA:
+        alerts = ALERTS
+    else:
+        alerts = []
+
+    sql_totals = _totals_from_sql()
+    if sql_totals is not None and (
+        sql_totals.get("people", 0) > 0 or not db.USE_SEED_DATA
+    ):
+        totals = sql_totals
+    elif db.USE_SEED_DATA:
+        totals = dashboard_totals()
+    else:
+        totals = {
+            "people": 0,
+            "current": 0,
+            "alerts": 0,
+            "advising": 0,
+            "low_confidence": 0,
+            "gaps": 0,
+        }
+
     return render_template(
         "faculty_home.html",
-        alerts=ALERTS,
+        alerts=alerts,
         students=students,
-        totals=dashboard_totals(),
+        totals=totals,
         q=request.args.get("q", ""),
         population=population,
         flag=flag,
@@ -309,19 +458,35 @@ def faculty_home():
 @app.route("/faculty/students/<student_id>")
 @require_roles(*FACULTY_ROLES)
 def student_detail(student_id):
-    student = student_by_id(student_id)
+    # D4: dashboard + checkins + v_active_alerts.
+    student = _student_from_sql_student_id(student_id, with_history=True)
+    if student is None and db.USE_SEED_DATA:
+        student = student_by_id(student_id)
     if student is None:
         return render_template("forbidden.html"), 404
+
+    sql_alerts = _active_alerts_from_sql(
+        user_id=student.get("user_id"),
+        student_id=student_id,
+    )
+    if _use_sql_result(sql_alerts):
+        detail_alerts = sql_alerts
+    elif db.USE_SEED_DATA:
+        detail_alerts = alerts_for(student_id)
+    else:
+        detail_alerts = []
+
     return render_template(
         "student_detail.html",
         student=student,
-        alerts=alerts_for(student_id),
+        alerts=detail_alerts,
     )
 
 
 @app.route("/faculty/alerts/<alert_id>/review", methods=["POST"])
 @require_roles(*FACULTY_ROLES)
 def review_alert(alert_id):
+    # Alert review UPDATE is Phase F; keep seed-list mutation for demo only.
     for alert in ALERTS:
         if alert["id"] == alert_id:
             alert["status"] = "reviewed"
@@ -333,10 +498,34 @@ def review_alert(alert_id):
 @app.route("/admin")
 @require_roles(*ADMIN_ROLES)
 def admin_home():
+    # D5: aggregates from views + v_accounts count.
+    sql_totals = _totals_from_sql()
+    if sql_totals is not None and (
+        sql_totals.get("people", 0) > 0 or not db.USE_SEED_DATA
+    ):
+        totals = sql_totals
+    elif db.USE_SEED_DATA:
+        totals = dashboard_totals()
+    else:
+        totals = {
+            "people": 0,
+            "current": 0,
+            "alerts": 0,
+            "advising": 0,
+            "low_confidence": 0,
+            "gaps": 0,
+        }
+
+    sql_count = _account_count_from_sql()
+    if _use_sql_result(sql_count):
+        user_count = sql_count
+    else:
+        user_count = len(USERS)
+
     return render_template(
         "admin_home.html",
-        totals=dashboard_totals(),
-        user_count=len(USERS),
+        totals=totals,
+        user_count=user_count,
     )
 
 

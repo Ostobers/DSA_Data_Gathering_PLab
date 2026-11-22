@@ -291,6 +291,9 @@ def home_redirect():
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    # HANDOFF (login student): replace seed_data plaintext compare with
+    # dbo.users.password_hash verify, session cookie hardening, and
+    # credential_version checks. Phase E only creates CHECK-safe rows + hash stub.
     if current_user():
         return redirect(home_for(current_user()))
 
@@ -326,6 +329,8 @@ def register():
 
 @app.route("/recover", methods=["GET", "POST"])
 def recover():
+    # HANDOFF (login student): password_reset_tokens (token_hash, expires_at,
+    # used_at) — issue + consume flow. Routing does not touch recovery.
     form = RecoverForm()
     if form.validate_on_submit():
         return redirect(url_for("recover_sent"))
@@ -350,22 +355,37 @@ def profile():
     if request.method == "POST":
         action = request.form.get("action")
         if action == "profile":
-            user["name"] = request.form.get("name", user["name"]).strip() or user["name"]
-            user["email"] = request.form.get("email", user["email"]).strip() or user["email"]
+            name = (request.form.get("name") or user["name"]).strip() or user["name"]
+            email_raw = (request.form.get("email") or user["email"]).strip() or user["email"]
+            email = db.normalize_email(email_raw)
+            if db.sql_configured():
+                try:
+                    db.update_user_profile(
+                        username=user["username"],
+                        name=name,
+                        email=email,
+                    )
+                except ValueError as exc:
+                    flash(str(exc), "error")
+                    return redirect(url_for("profile"))
+                except (RuntimeError, SQLAlchemyError, DBAPIError):
+                    app.logger.exception("SQL profile update failed")
+                    if not db.USE_SEED_DATA:
+                        flash("Could not update profile in the database.", "error")
+                        return redirect(url_for("profile"))
+                    # Fall through to seed_data when SQL is down.
+            # Keep session demo dict in sync (login still reads seed_data).
+            user["name"] = name
+            user["email"] = email
             flash("Profile updated.")
         elif action == "password":
-            current = request.form.get("current", "")
-            new_password = request.form.get("new_password", "")
-            confirm = request.form.get("confirm", "")
-            if current != user["password"]:
-                flash("Current password is incorrect.", "error")
-            elif len(new_password) < 4:
-                flash("New password must be at least 4 characters.", "error")
-            elif new_password != confirm:
-                flash("New passwords do not match.", "error")
-            else:
-                user["password"] = new_password
-                flash("Password updated for this demo session.")
+            # HANDOFF (login student): verify against password_hash, update hash,
+            # bump credential_version, invalidate sessions. Do not wire here.
+            flash(
+                "Password changes against dbo.users are owned by the login student "
+                "(hash verify + credential_version). Demo seed password unchanged.",
+                "error",
+            )
         return redirect(url_for("profile"))
     return render_template("profile.html")
 
@@ -529,39 +549,162 @@ def admin_home():
     )
 
 
+def _accounts_from_sql():
+    return _try_sql(db.fetch_accounts)
+
+
+def _create_user_seed(username, name, email, role, population):
+    """In-memory create when SQL is off / falling back."""
+    if username in USERS:
+        raise ValueError("That username already exists.")
+    if role in {ROLE_FACULTY, ROLE_ADMIN}:
+        display_pop = (
+            "Faculty adviser" if role == ROLE_FACULTY else "Program administrator"
+        )
+    else:
+        display_pop = population or "Current student"
+    USERS[username] = {
+        "username": username,
+        "password": "demo",
+        "name": name,
+        "email": email,
+        "role": role,
+        "status": "active",
+        "population": display_pop,
+        "student_id": None,
+    }
+
+
 @app.route("/users", methods=["GET", "POST"])
 @require_roles(*ADMIN_ROLES)
 def users():
     if request.method == "POST":
         action = request.form.get("action")
         if action == "create":
-            username = (request.form.get("username") or "").strip()
+            username = db.normalize_username(request.form.get("username") or "")
+            name = db.normalize_name(request.form.get("name") or "") or username
+            email = db.normalize_email(request.form.get("email") or "")
+            role = (request.form.get("role") or ROLE_STUDENT).strip()
+            population = (request.form.get("population") or "").strip() or None
             if not username:
                 flash("Username is required.", "error")
-            elif username in USERS:
-                flash("That username already exists.", "error")
+            elif db.sql_configured():
+                actor_id = actor_user_id()
+                try:
+                    # Temporary plaintext "demo"; hash_password stores TEMP_SHA256
+                    # (or login student's registered hasher). Login verify is out of scope.
+                    account = db.create_user(
+                        username=username,
+                        name=name,
+                        email=email,
+                        role=role,
+                        password_plain="demo",
+                        population=population or "Current student",
+                        actor_user_id=actor_id,
+                    )
+                    # Mirror into seed dict so require_roles/current_user still work
+                    # until login student reads dbo.users.
+                    if username not in USERS:
+                        USERS[username] = {
+                            "username": account["username"],
+                            "password": "demo",
+                            "name": account["name"],
+                            "email": account["email"],
+                            "role": account["role"],
+                            "status": account["status"],
+                            "population": account["population"],
+                            "student_id": account.get("student_id"),
+                        }
+                    flash(
+                        "Account created (SQL). Temporary password demo; "
+                        "hash is TEMP_SHA256 until login student registers hasher."
+                    )
+                except ValueError as exc:
+                    flash(str(exc), "error")
+                except (RuntimeError, SQLAlchemyError, DBAPIError) as exc:
+                    app.logger.exception("SQL create_user failed")
+                    # Integrity / CHECK failures often surface as DBAPIError.
+                    msg = str(getattr(exc, "orig", exc))
+                    if db.USE_SEED_DATA:
+                        try:
+                            _create_user_seed(username, name, email, role, population)
+                            flash(
+                                "SQL create failed; created in seed_data fallback. "
+                                f"({msg})",
+                                "error",
+                            )
+                        except ValueError as seed_exc:
+                            flash(str(seed_exc), "error")
+                    else:
+                        flash(f"Could not create account: {msg}", "error")
+            elif db.USE_SEED_DATA:
+                try:
+                    _create_user_seed(username, name, email, role, population)
+                    flash("Account created with temporary password demo.")
+                except ValueError as exc:
+                    flash(str(exc), "error")
             else:
-                USERS[username] = {
-                    "username": username,
-                    "password": "demo",
-                    "name": (request.form.get("name") or username).strip(),
-                    "email": (request.form.get("email") or "").strip(),
-                    "role": request.form.get("role") or ROLE_STUDENT,
-                    "status": "active",
-                    "population": "Created in prototype",
-                    "student_id": None,
-                }
-                flash("Account created with temporary password demo.")
+                flash("SQL is not configured; cannot create accounts.", "error")
         elif action in {"disable", "enable"}:
-            username = request.form.get("username")
-            account = USERS.get(username)
-            if account and account["username"] != current_user()["username"]:
-                account["status"] = "disabled" if action == "disable" else "active"
-                flash("Account updated.")
-            elif account:
+            username = db.normalize_username(request.form.get("username") or "")
+            new_status = "disabled" if action == "disable" else "active"
+            if username == current_user()["username"]:
                 flash("You cannot disable your own account.", "error")
+            elif db.sql_configured():
+                actor_id = actor_user_id()
+                if actor_id is None:
+                    flash(
+                        "Admin actor is not provisioned in dbo.users "
+                        "(need actor_user_id for admin_audit).",
+                        "error",
+                    )
+                else:
+                    try:
+                        db.set_user_status(
+                            username=username,
+                            status=new_status,
+                            actor_user_id=actor_id,
+                        )
+                        seed = USERS.get(username)
+                        if seed:
+                            seed["status"] = new_status
+                        flash("Account updated.")
+                    except ValueError as exc:
+                        flash(str(exc), "error")
+                    except (RuntimeError, SQLAlchemyError, DBAPIError):
+                        app.logger.exception("SQL set_user_status failed")
+                        if db.USE_SEED_DATA:
+                            account = USERS.get(username)
+                            if account:
+                                account["status"] = new_status
+                                flash("SQL status update failed; updated seed_data.")
+                            else:
+                                flash("Could not update account status.", "error")
+                        else:
+                            flash("Could not update account status.", "error")
+            elif db.USE_SEED_DATA:
+                account = USERS.get(username)
+                if account:
+                    account["status"] = new_status
+                    flash("Account updated.")
+                else:
+                    flash("Account not found.", "error")
+            else:
+                flash("SQL is not configured; cannot update accounts.", "error")
+        elif action == "lifecycle":
+            # Stub: helper db.update_user_lifecycle exists; no admin UI yet.
+            flash(
+                "Lifecycle / program_records updates use db.update_user_lifecycle "
+                "(atomic + admin_audit). Wire an admin form when ready.",
+                "error",
+            )
         return redirect(url_for("users"))
-    accounts = sorted(USERS.values(), key=lambda a: a["name"].lower())
+
+    sql_accounts = _accounts_from_sql()
+    if _use_sql_result(sql_accounts):
+        accounts = sql_accounts
+    else:
+        accounts = sorted(USERS.values(), key=lambda a: a["name"].lower())
     return render_template("users.html", accounts=accounts)
 
 

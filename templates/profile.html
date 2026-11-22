@@ -23,7 +23,7 @@
     <input id="new_password" name="new_password" type="password" minlength="4" autocomplete="new-password">
     <label for="confirm">Confirm new password</label>
     <input id="confirm" name="confirm" type="password" minlength="4" autocomplete="new-password">
-    <p class="note">Frontend prototype: this updates the demo session only, and does not hash or store a real password yet.</p>
+    <p class="note">Login student owns password change: verify current hash, write <code>password_hash</code>, bump <code>credential_version</code>, and invalidate sessions. This button is a handoff stub.</p>
     <p><button type="submit" name="action" value="password">Update password</button></p>
   </form>
 </div>

@@ -3,17 +3,22 @@
 Uses MSSQL_* compose env vars and ODBC Driver 18. Phase D view helpers
 prefer SQL when connected; USE_SEED_DATA still allows seed_data fallback
 when SQL is unavailable or empty.
+
+Phase E adds users CRUD (list/create/status/profile) plus admin_audit.
+Password verify, bcrypt, recovery tokens, and credential_version flows
+belong to the login student — see hash_password / register_password_hasher.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import urllib.parse
 from typing import Any, Callable, Mapping, Optional
 
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine, Result
+from sqlalchemy.engine import Connection, Engine, Result
 
 # When True, allow in-memory seed_data fallback if SQL is unavailable or empty.
 # Prefer SQL view reads whenever the engine connects successfully.
@@ -24,6 +29,16 @@ _engine: Optional[Engine] = None
 # Alerts-student extension point: callables invoked after a successful @submit=1.
 # Signature: (result_row: Mapping, payload: Mapping, actor_user_id: int) -> None
 _AFTER_SUBMIT_HOOKS: list[Callable[..., None]] = []
+
+# Login-student extension point: replace TEMP_SHA256 placeholder with bcrypt/argon2.
+# Signature: (plain_password: str) -> str  (≤ 512 chars for dbo.users.password_hash)
+_PASSWORD_HASHER: Optional[Callable[[str], str]] = None
+
+STUDENT_POPULATIONS = frozenset(
+    {"Applicant", "Current student", "Graduate", "Inactive"}
+)
+ACCOUNT_ROLES = frozenset({"student", "faculty", "admin"})
+ACCOUNT_STATUSES = frozenset({"active", "disabled"})
 
 
 def register_after_submit_hook(hook: Callable[..., None]) -> None:
@@ -38,6 +53,69 @@ def run_after_submit_hooks(
 ) -> None:
     for hook in list(_AFTER_SUBMIT_HOOKS):
         hook(result_row, payload, actor_user_id)
+
+
+def register_password_hasher(hasher: Callable[[str], str]) -> None:
+    """Login student: register production password hasher (bcrypt/argon2).
+
+    Until registered, create-account uses a TEMP_SHA256 placeholder so the
+    NOT NULL password_hash column can be filled. Do not use that placeholder
+    for login verify — login student owns verify + credential_version.
+    """
+    global _PASSWORD_HASHER
+    _PASSWORD_HASHER = hasher
+
+
+def hash_password(plain: str) -> str:
+    """Hash a plaintext password for dbo.users.password_hash (NVARCHAR(512)).
+
+    Temporary default is a labeled SHA-256 placeholder so routing can INSERT
+    accounts without inventing production bcrypt wiring. Login student must
+    call register_password_hasher(...) and implement verify on /login.
+    """
+    if not plain:
+        raise ValueError("password must be non-empty")
+    if _PASSWORD_HASHER is not None:
+        hashed = _PASSWORD_HASHER(plain)
+        if not hashed or len(hashed) > 512:
+            raise ValueError("password hasher must return 1..512 characters")
+        return hashed
+    digest = hashlib.sha256(plain.encode("utf-8")).hexdigest()
+    # Prefix makes the placeholder obvious in SQL and unfit for silent verify.
+    return f"TEMP_SHA256:{digest}"
+
+
+def normalize_email(email: str) -> str:
+    """Lowercase + trim to satisfy dbo.users email CHECK."""
+    return (email or "").strip().lower()
+
+
+def normalize_username(username: str) -> str:
+    return (username or "").strip()
+
+
+def normalize_name(name: str) -> str:
+    return (name or "").strip()
+
+
+def check_safe_population(*, role: str, population: Optional[str]) -> Optional[str]:
+    """Return population for INSERT/UPDATE, or raise ValueError.
+
+    Faculty/admin must store population NULL (v_accounts supplies display labels).
+    Students require a CHECK-allowed lifecycle category.
+    """
+    role = (role or "").strip()
+    if role not in ACCOUNT_ROLES:
+        raise ValueError(f"role must be one of {sorted(ACCOUNT_ROLES)}")
+    if role in {"faculty", "admin"}:
+        return None
+    pop = (population or "").strip()
+    if pop not in STUDENT_POPULATIONS:
+        raise ValueError(
+            "student population must be one of "
+            + ", ".join(sorted(STUDENT_POPULATIONS))
+        )
+    return pop
 
 
 def _odbc_connect_string() -> str:
@@ -585,3 +663,412 @@ def save_survey_response(
     if not rows:
         raise RuntimeError("save_survey_response returned no result row")
     return rows[0]
+
+
+# ---------------------------------------------------------------------------
+# Phase E — users CRUD (non-auth) + admin_audit
+# ---------------------------------------------------------------------------
+
+
+def map_account_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Map v_accounts / users columns to the users.html account dict."""
+    return {
+        "id": _as_int_or_none(row.get("id")),
+        "username": row.get("username") or "",
+        "name": row.get("name") or "",
+        "email": row.get("email") or "",
+        "role": row.get("role") or "",
+        "status": row.get("status") or "",
+        "population": row.get("population") or "",
+        "student_id": row.get("student_id"),
+        "preferred_contact": row.get("preferred_contact") or "email",
+    }
+
+
+def fetch_accounts() -> list[dict[str, Any]]:
+    """List accounts from dbo.v_accounts (display population for staff)."""
+    rows = fetch_all(
+        """
+        SELECT id, username, name, email, role, status, population,
+               student_id, preferred_contact, created_at, updated_at
+        FROM dbo.v_accounts
+        ORDER BY name
+        """
+    )
+    return [map_account_row(r) for r in rows]
+
+
+def fetch_account_by_username(username: str) -> Optional[dict[str, Any]]:
+    row = fetch_one(
+        """
+        SELECT id, username, name, email, role, status, population,
+               student_id, preferred_contact, created_at, updated_at
+        FROM dbo.v_accounts
+        WHERE username = :username
+        """,
+        {"username": normalize_username(username)},
+    )
+    return map_account_row(row) if row else None
+
+
+def _insert_admin_audit(
+    conn: Connection,
+    *,
+    actor_user_id: int,
+    action_code: str,
+    entity_type: str,
+    entity_key: str,
+) -> None:
+    conn.execute(
+        text(
+            """
+            INSERT dbo.admin_audit(actor_user_id, action_code, entity_type, entity_key)
+            VALUES (:actor_user_id, :action_code, :entity_type, :entity_key)
+            """
+        ),
+        {
+            "actor_user_id": actor_user_id,
+            "action_code": action_code,
+            "entity_type": entity_type,
+            "entity_key": str(entity_key)[:100],
+        },
+    )
+
+
+def insert_admin_audit(
+    *,
+    actor_user_id: int,
+    action_code: str,
+    entity_type: str,
+    entity_key: str,
+) -> None:
+    """Standalone admin_audit INSERT (prefer same-transaction helpers below)."""
+    with get_engine().begin() as conn:
+        _insert_admin_audit(
+            conn,
+            actor_user_id=actor_user_id,
+            action_code=action_code,
+            entity_type=entity_type,
+            entity_key=entity_key,
+        )
+
+
+def create_user(
+    *,
+    username: str,
+    name: str,
+    email: str,
+    role: str,
+    password_plain: str = "demo",
+    population: Optional[str] = None,
+    student_id: Optional[str] = None,
+    preferred_contact: str = "email",
+    actor_user_id: Optional[int] = None,
+    create_program_record: bool = True,
+) -> dict[str, Any]:
+    """INSERT dbo.users with CHECK-safe fields; optional program_records + audit.
+
+    population is forced NULL for faculty/admin. password_hash comes from
+    hash_password (pluggable; TEMP_SHA256 until login student registers hasher).
+    """
+    username = normalize_username(username)
+    name = normalize_name(name)
+    email = normalize_email(email)
+    role = (role or "").strip()
+    preferred_contact = (preferred_contact or "email").strip()
+
+    if not (4 <= len(username) <= 20):
+        raise ValueError("username must be 4–20 characters")
+    if not name:
+        raise ValueError("name is required")
+    if not email:
+        raise ValueError("email is required")
+    if preferred_contact not in {"email", "in_app"}:
+        raise ValueError("preferred_contact must be email or in_app")
+
+    safe_population = check_safe_population(role=role, population=population)
+    if role in {"faculty", "admin"}:
+        student_id = None
+    elif student_id is not None:
+        student_id = student_id.strip() or None
+
+    password_hash = hash_password(password_plain)
+
+    with get_engine().begin() as conn:
+        result = conn.execute(
+            text(
+                """
+                INSERT dbo.users (
+                    username, name, email, password_hash, role, status,
+                    population, student_id, preferred_contact
+                )
+                OUTPUT INSERTED.id, INSERTED.username, INSERTED.name,
+                       INSERTED.email, INSERTED.role, INSERTED.status,
+                       INSERTED.population, INSERTED.student_id,
+                       INSERTED.preferred_contact
+                VALUES (
+                    :username, :name, :email, :password_hash, :role, 'active',
+                    :population, :student_id, :preferred_contact
+                )
+                """
+            ),
+            {
+                "username": username,
+                "name": name,
+                "email": email,
+                "password_hash": password_hash,
+                "role": role,
+                "population": safe_population,
+                "student_id": student_id,
+                "preferred_contact": preferred_contact,
+            },
+        )
+        row = result.mappings().one()
+        user_id = int(row["id"])
+
+        if role == "student" and create_program_record:
+            conn.execute(
+                text(
+                    """
+                    INSERT dbo.program_records (user_id)
+                    VALUES (:user_id)
+                    """
+                ),
+                {"user_id": user_id},
+            )
+
+        if actor_user_id is not None:
+            _insert_admin_audit(
+                conn,
+                actor_user_id=actor_user_id,
+                action_code="create_user",
+                entity_type="users",
+                entity_key=str(user_id),
+            )
+
+    account = map_account_row(row)
+    # Staff display labels match v_accounts CASE expression.
+    if account["role"] == "faculty":
+        account["population"] = "Faculty adviser"
+    elif account["role"] == "admin":
+        account["population"] = "Program administrator"
+    return account
+
+
+def set_user_status(
+    *,
+    username: str,
+    status: str,
+    actor_user_id: int,
+) -> dict[str, Any]:
+    """UPDATE users.status (active/disabled) and write admin_audit."""
+    username = normalize_username(username)
+    status = (status or "").strip()
+    if status not in ACCOUNT_STATUSES:
+        raise ValueError(f"status must be one of {sorted(ACCOUNT_STATUSES)}")
+
+    with get_engine().begin() as conn:
+        result = conn.execute(
+            text(
+                """
+                UPDATE dbo.users
+                SET status = :status,
+                    updated_at = SYSUTCDATETIME()
+                OUTPUT INSERTED.id, INSERTED.username, INSERTED.name,
+                       INSERTED.email, INSERTED.role, INSERTED.status,
+                       INSERTED.population, INSERTED.student_id,
+                       INSERTED.preferred_contact
+                WHERE username = :username
+                """
+            ),
+            {"username": username, "status": status},
+        )
+        row = result.mappings().first()
+        if not row:
+            raise ValueError(f"user not found: {username}")
+        action = "disable_user" if status == "disabled" else "enable_user"
+        _insert_admin_audit(
+            conn,
+            actor_user_id=actor_user_id,
+            action_code=action,
+            entity_type="users",
+            entity_key=str(row["id"]),
+        )
+    return map_account_row(row)
+
+
+def update_user_profile(
+    *,
+    username: str,
+    name: str,
+    email: str,
+    actor_user_id: Optional[int] = None,
+    audit: bool = False,
+) -> dict[str, Any]:
+    """UPDATE users name/email only (password/credential_version → login student).
+
+    audit=True writes admin_audit when an admin changes another account's
+    profile; self-service profile saves leave audit=False.
+    """
+    username = normalize_username(username)
+    name = normalize_name(name)
+    email = normalize_email(email)
+    if not name:
+        raise ValueError("name is required")
+    if not email:
+        raise ValueError("email is required")
+
+    with get_engine().begin() as conn:
+        result = conn.execute(
+            text(
+                """
+                UPDATE dbo.users
+                SET name = :name,
+                    email = :email,
+                    updated_at = SYSUTCDATETIME()
+                OUTPUT INSERTED.id, INSERTED.username, INSERTED.name,
+                       INSERTED.email, INSERTED.role, INSERTED.status,
+                       INSERTED.population, INSERTED.student_id,
+                       INSERTED.preferred_contact
+                WHERE username = :username
+                """
+            ),
+            {"username": username, "name": name, "email": email},
+        )
+        row = result.mappings().first()
+        if not row:
+            raise ValueError(f"user not found: {username}")
+        if audit and actor_user_id is not None:
+            _insert_admin_audit(
+                conn,
+                actor_user_id=actor_user_id,
+                action_code="update_profile",
+                entity_type="users",
+                entity_key=str(row["id"]),
+            )
+    return map_account_row(row)
+
+
+def update_user_lifecycle(
+    *,
+    user_id: int,
+    population: str,
+    actor_user_id: int,
+    entry_term_id: Optional[int] = None,
+    expected_graduation: Optional[str] = None,
+    graduation_date: Optional[str] = None,
+    application_status: Optional[str] = None,
+) -> dict[str, Any]:
+    """Atomic student lifecycle + program_records update with admin_audit.
+
+    Only for role=student. Faculty/admin must keep population NULL.
+    UI for this helper is optional; routes may stub until a lifecycle form ships.
+    """
+    population = check_safe_population(role="student", population=population)
+    assert population is not None
+
+    allowed_app = {
+        None,
+        "interested",
+        "applied",
+        "admitted",
+        "declined",
+        "enrolled",
+        "withdrawn",
+    }
+    if application_status not in allowed_app:
+        raise ValueError("invalid application_status")
+
+    with get_engine().begin() as conn:
+        user_row = conn.execute(
+            text(
+                """
+                SELECT id, role, status FROM dbo.users WITH (UPDLOCK, HOLDLOCK)
+                WHERE id = :user_id
+                """
+            ),
+            {"user_id": user_id},
+        ).mappings().first()
+        if not user_row:
+            raise ValueError(f"user not found: {user_id}")
+        if user_row["role"] != "student":
+            raise ValueError("lifecycle updates apply only to student accounts")
+
+        result = conn.execute(
+            text(
+                """
+                UPDATE dbo.users
+                SET population = :population,
+                    lifecycle_changed_at = SYSUTCDATETIME(),
+                    updated_at = SYSUTCDATETIME()
+                OUTPUT INSERTED.id, INSERTED.username, INSERTED.name,
+                       INSERTED.email, INSERTED.role, INSERTED.status,
+                       INSERTED.population, INSERTED.student_id,
+                       INSERTED.preferred_contact
+                WHERE id = :user_id
+                """
+            ),
+            {"user_id": user_id, "population": population},
+        )
+        row = result.mappings().one()
+
+        # Upsert program_records in the same transaction.
+        existing = conn.execute(
+            text(
+                "SELECT program_record_id FROM dbo.program_records WHERE user_id = :user_id"
+            ),
+            {"user_id": user_id},
+        ).first()
+        if existing:
+            conn.execute(
+                text(
+                    """
+                    UPDATE dbo.program_records
+                    SET entry_term_id = COALESCE(:entry_term_id, entry_term_id),
+                        expected_graduation = COALESCE(:expected_graduation, expected_graduation),
+                        graduation_date = COALESCE(:graduation_date, graduation_date),
+                        application_status = COALESCE(:application_status, application_status),
+                        updated_at = SYSUTCDATETIME()
+                    WHERE user_id = :user_id
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "entry_term_id": entry_term_id,
+                    "expected_graduation": expected_graduation,
+                    "graduation_date": graduation_date,
+                    "application_status": application_status,
+                },
+            )
+        else:
+            conn.execute(
+                text(
+                    """
+                    INSERT dbo.program_records (
+                        user_id, entry_term_id, expected_graduation,
+                        graduation_date, application_status
+                    )
+                    VALUES (
+                        :user_id, :entry_term_id, :expected_graduation,
+                        :graduation_date, :application_status
+                    )
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "entry_term_id": entry_term_id,
+                    "expected_graduation": expected_graduation,
+                    "graduation_date": graduation_date,
+                    "application_status": application_status,
+                },
+            )
+
+        _insert_admin_audit(
+            conn,
+            actor_user_id=actor_user_id,
+            action_code="update_lifecycle",
+            entity_type="users",
+            entity_key=str(user_id),
+        )
+
+    return map_account_row(row)

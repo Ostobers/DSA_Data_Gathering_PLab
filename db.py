@@ -7,15 +7,21 @@ when SQL is unavailable or empty.
 Phase E adds users CRUD (list/create/status/profile) plus admin_audit.
 Password verify, bcrypt, recovery tokens, and credential_version flows
 belong to the login student — see hash_password / register_password_hasher.
+
+Phase F adds post-submit side effects (contact_preferences, follow_up_requests,
+graduate survey_assignments), faculty alert review UPDATE, and a gated
+alerts-student after-submit hook (DSA_ALERTS_EVAL_ENABLED).
 """
 
 from __future__ import annotations
 
+import calendar
 import hashlib
 import json
 import os
 import urllib.parse
-from typing import Any, Callable, Mapping, Optional
+from datetime import date, datetime
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine, Result
@@ -24,10 +30,15 @@ from sqlalchemy.engine import Connection, Engine, Result
 # Prefer SQL view reads whenever the engine connects successfully.
 USE_SEED_DATA = os.environ.get("USE_SEED_DATA", "1") == "1"
 
+# Alerts student: set DSA_ALERTS_EVAL_ENABLED=1 and register_after_submit_hook(...)
+# to evaluate the eight rules after a successful final submit. Default off.
+ALERTS_EVAL_ENABLED = os.environ.get("DSA_ALERTS_EVAL_ENABLED", "0") == "1"
+
 _engine: Optional[Engine] = None
 
-# Alerts-student extension point: callables invoked after a successful @submit=1.
-# Signature: (result_row: Mapping, payload: Mapping, actor_user_id: int) -> None
+# Alerts-student extension point: callables invoked after a successful @submit=1
+# when ALERTS_EVAL_ENABLED. Signature:
+#   (result_row: Mapping, payload: Mapping, actor_user_id: int) -> None
 _AFTER_SUBMIT_HOOKS: list[Callable[..., None]] = []
 
 # Login-student extension point: replace TEMP_SHA256 placeholder with bcrypt/argon2.
@@ -42,8 +53,24 @@ ACCOUNT_STATUSES = frozenset({"active", "disabled"})
 
 
 def register_after_submit_hook(hook: Callable[..., None]) -> None:
-    """Register a post-submit callback (alerts student attaches evaluators here)."""
+    """Register an alerts-student evaluator callback.
+
+    Called only after a successful final submit (@submit=1) when
+    DSA_ALERTS_EVAL_ENABLED=1. Routing side effects (contact prefs,
+    follow-ups, graduate assignments) run separately via
+    apply_post_submit_side_effects — do not put those in this hook.
+    """
     _AFTER_SUBMIT_HOOKS.append(hook)
+
+
+def clear_after_submit_hooks() -> None:
+    """Test helper: remove all registered alerts hooks."""
+    _AFTER_SUBMIT_HOOKS.clear()
+
+
+def alerts_eval_enabled() -> bool:
+    """True when DSA_ALERTS_EVAL_ENABLED=1 (re-reads env for tests/lab toggles)."""
+    return os.environ.get("DSA_ALERTS_EVAL_ENABLED", "0") == "1"
 
 
 def run_after_submit_hooks(
@@ -51,6 +78,14 @@ def run_after_submit_hooks(
     payload: Mapping[str, Any],
     actor_user_id: int,
 ) -> None:
+    """Invoke alerts-student hooks when DSA_ALERTS_EVAL_ENABLED=1.
+
+    No-op when the flag is off (default) so lab submits stay quiet until
+    the alerts student opts in. Failures are not swallowed here — callers
+    (Hello.py) should catch so a bad evaluator cannot undo a saved response.
+    """
+    if not alerts_eval_enabled():
+        return
     for hook in list(_AFTER_SUBMIT_HOOKS):
         hook(result_row, payload, actor_user_id)
 
@@ -456,14 +491,22 @@ def map_student_dashboard_row(
 
 
 def map_active_alert_row(row: Mapping[str, Any]) -> dict[str, Any]:
-    """Map v_active_alerts to seed_data ALERTS shape used by templates."""
+    """Map v_active_alerts to seed_data ALERTS shape used by templates.
+
+    View columns (no title): alert_id, user_id, student_id, student, rule_code,
+    version_number, severity, rule_description, source_response_id, trigger_values,
+    alert_description, alert_status, created_at.
+    """
     return {
         "id": str(row.get("alert_id")),
         "student_id": row.get("student_id"),
         "student": row.get("student") or "",
-        "type": row.get("title") or row.get("alert_description") or row.get("rule_code") or "",
+        "type": row.get("alert_description")
+        or row.get("severity")
+        or row.get("rule_code")
+        or "",
         "rule": row.get("rule_description") or row.get("rule_code") or "",
-        "value": row.get("trigger_values") or row.get("alert_description") or "",
+        "value": row.get("trigger_values") or "",
         "status": row.get("alert_status") or "active",
         "user_id": _as_int_or_none(row.get("user_id")),
     }
@@ -581,7 +624,7 @@ def fetch_active_alerts(
     return fetch_all(
         f"""
         SELECT alert_id, user_id, student_id, student, rule_code, version_number,
-               title, rule_description, source_response_id, trigger_values,
+               severity, rule_description, source_response_id, trigger_values,
                alert_description, alert_status, created_at
         FROM dbo.v_active_alerts
         WHERE {where}
@@ -1093,4 +1136,600 @@ def update_user_lifecycle(
             entity_key=str(user_id),
         )
 
+    # When an actual graduation_date lands, schedule 3/6/12 if contact allows.
+    if graduation_date:
+        try:
+            ensure_graduate_followup_assignments(user_id=user_id)
+        except Exception:
+            # Lifecycle write already committed; scheduling is best-effort.
+            pass
+
     return map_account_row(row)
+
+
+# ---------------------------------------------------------------------------
+# Phase F — post-submit side effects, alert review, graduate outcomes
+# ---------------------------------------------------------------------------
+
+# Yes/No ask codes that create dbo.follow_up_requests when answered "Yes".
+# details_code is optional free-text / long companion (may be absent).
+FOLLOW_UP_QUESTION_SPECS: tuple[dict[str, Optional[str]], ...] = (
+    {
+        "ask": "C5",
+        "topic": "Advising request (pulse)",
+        "details": None,
+    },
+    {
+        "ask": "A8",
+        "topic": "Career or advising help before graduation",
+        "details": None,
+    },
+    {
+        "ask": "L1-18",
+        "topic": "Beginning of program follow-up",
+        "details": "L1-18a",
+    },
+    {
+        "ask": "L2-18",
+        "topic": "Semester start follow-up",
+        "details": "L2-18a",
+    },
+    {
+        "ask": "S4-8",
+        "topic": "Career plans follow-up",
+        "details": "S4-8a",
+    },
+    {
+        "ask": "L4-17",
+        "topic": "Career / internship follow-up",
+        "details": "L4-16",
+    },
+)
+
+GRADUATE_FOLLOWUP_MONTHS: tuple[int, ...] = (3, 6, 12)
+NEAR_GRAD_SURVEY_CODE = "near_0"
+AFTER_GRAD_SURVEY_CODE = "after_0"
+
+
+def add_calendar_months(start: date, months: int) -> date:
+    """Add whole calendar months, clamping the day to the target month length."""
+    if months < 0:
+        raise ValueError("months must be non-negative")
+    year = start.year + (start.month - 1 + months) // 12
+    month = (start.month - 1 + months) % 12 + 1
+    day = min(start.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def parse_contact_permission(answers: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+    """Derive contact_preferences fields from near-grad A9/A10 answers.
+
+    Returns None when A9 is absent (not a near-grad contact answer set).
+    Withdrawal (A9=No) clears personal_email to satisfy the SQL CHECK.
+    """
+    a9 = answers.get("A9")
+    if a9 is None:
+        return None
+    allow = str(a9).strip() == "Yes"
+    email = None
+    if allow:
+        raw = answers.get("A10")
+        if raw is not None and str(raw).strip():
+            email = normalize_email(str(raw))
+    return {
+        "allow_graduate_contact": allow,
+        "personal_email": email if allow else None,
+    }
+
+
+def extract_follow_up_requests(
+    answers: Mapping[str, Any],
+    *,
+    specs: Sequence[Mapping[str, Optional[str]]] = FOLLOW_UP_QUESTION_SPECS,
+) -> list[dict[str, Any]]:
+    """Build follow_up_requests rows from Yes answers (pure; no SQL)."""
+    out: list[dict[str, Any]] = []
+    for spec in specs:
+        ask = spec.get("ask")
+        if not ask:
+            continue
+        if str(answers.get(ask) or "").strip() != "Yes":
+            continue
+        topic = (spec.get("topic") or ask)[:100]
+        details = None
+        details_code = spec.get("details")
+        if details_code and answers.get(details_code) is not None:
+            details = str(answers.get(details_code)).strip()[:2000] or None
+        out.append({"topic": topic, "details": details, "ask_code": ask})
+    return out
+
+
+def graduate_assignment_event_key(followup_month: int) -> str:
+    if followup_month not in GRADUATE_FOLLOWUP_MONTHS:
+        raise ValueError(f"followup_month must be one of {GRADUATE_FOLLOWUP_MONTHS}")
+    return f"after_0:m{followup_month}"
+
+
+def notice_version_label(
+    *,
+    survey_code: str,
+    version_number: Any,
+    variant: str,
+) -> str:
+    """Stable notice_version string stored on contact_preferences (≤100 chars)."""
+    label = f"{survey_code}:v{version_number}:{variant}"
+    return label[:100]
+
+
+def map_graduate_outcomes_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Map v_latest_graduate_outcomes → student_detail employment shape.
+
+    R10 gap: the view returns the latest after_0 only — not one row per
+    followup_month wave. Wave-specific reporting needs a different query.
+    """
+    return {
+        "status": row.get("employment_status") or "—",
+        "months_to_job": _as_int_or_none(row.get("months_to_job")),
+        "title": row.get("job_title") or "—",
+        "industry": row.get("industry") or "—",
+        "uses_ds": row.get("uses_ds_skills") or "—",
+        "salary": row.get("salary_range") or "—",
+        "prep": _as_int_or_none(row.get("employment_preparation")),
+        "graduation_term": row.get("graduation_term"),
+        "response_id": row.get("response_id"),
+        "submitted_at": _iso_date(row.get("submitted_at")),
+        # Explicit so faculty UI / handoffs can surface the analytics limit.
+        "r10_note": "Latest after_0 only — not per followup_month wave (R10).",
+    }
+
+
+def fetch_latest_graduate_outcomes(
+    user_id: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """Read dbo.v_latest_graduate_outcomes (optional single-user filter)."""
+    clauses = ["1=1"]
+    params: dict[str, Any] = {}
+    if user_id is not None:
+        clauses.append("user_id = :user_id")
+        params["user_id"] = user_id
+    where = " AND ".join(clauses)
+    return fetch_all(
+        f"""
+        SELECT user_id, response_id, submitted_at, graduation_term,
+               employment_status, months_to_job, job_title, industry,
+               uses_ds_skills, job_source, salary_range, months_searching,
+               employment_preparation
+        FROM dbo.v_latest_graduate_outcomes
+        WHERE {where}
+        ORDER BY submitted_at DESC, response_id DESC
+        """,
+        params,
+    )
+
+
+def fetch_survey_version_meta(survey_version_id: int) -> Optional[dict[str, Any]]:
+    return fetch_one(
+        """
+        SELECT survey_version_id, survey_code, version_number, variant,
+               survey_title, form_title, audience, publication_status,
+               notice_text
+        FROM dbo.survey_versions
+        WHERE survey_version_id = :survey_version_id
+        """,
+        {"survey_version_id": survey_version_id},
+    )
+
+
+def resolve_published_after_grad_version_id(
+    *,
+    preferred_variant: str = "short",
+) -> Optional[int]:
+    """Pick a published after_0 version for graduate follow-up assignments."""
+    row = fetch_one(
+        """
+        SELECT TOP 1 survey_version_id
+        FROM dbo.survey_versions
+        WHERE survey_code = :survey_code
+          AND publication_status = 'published'
+        ORDER BY CASE WHEN variant = :preferred_variant THEN 0 ELSE 1 END,
+                 version_number DESC, survey_version_id
+        """,
+        {
+            "survey_code": AFTER_GRAD_SURVEY_CODE,
+            "preferred_variant": preferred_variant,
+        },
+    )
+    return int(row["survey_version_id"]) if row else None
+
+
+def upsert_contact_preferences(
+    *,
+    user_id: int,
+    allow_graduate_contact: bool,
+    personal_email: Optional[str],
+    notice_version: str,
+) -> dict[str, Any]:
+    """INSERT/UPDATE dbo.contact_preferences (CHECK-safe email rules)."""
+    notice_version = (notice_version or "").strip()[:100]
+    if not notice_version:
+        raise ValueError("notice_version is required")
+    if not allow_graduate_contact:
+        personal_email = None
+    elif personal_email is not None:
+        personal_email = normalize_email(personal_email)
+        if not personal_email:
+            personal_email = None
+
+    with get_engine().begin() as conn:
+        existing = conn.execute(
+            text(
+                "SELECT user_id FROM dbo.contact_preferences WHERE user_id = :user_id"
+            ),
+            {"user_id": user_id},
+        ).first()
+        params = {
+            "user_id": user_id,
+            "allow_graduate_contact": 1 if allow_graduate_contact else 0,
+            "personal_email": personal_email,
+            "notice_version": notice_version,
+        }
+        if existing:
+            conn.execute(
+                text(
+                    """
+                    UPDATE dbo.contact_preferences
+                    SET allow_graduate_contact = :allow_graduate_contact,
+                        personal_email = :personal_email,
+                        notice_version = :notice_version,
+                        recorded_at = SYSUTCDATETIME()
+                    WHERE user_id = :user_id
+                    """
+                ),
+                params,
+            )
+        else:
+            conn.execute(
+                text(
+                    """
+                    INSERT dbo.contact_preferences (
+                        user_id, allow_graduate_contact, personal_email, notice_version
+                    )
+                    VALUES (
+                        :user_id, :allow_graduate_contact, :personal_email, :notice_version
+                    )
+                    """
+                ),
+                params,
+            )
+    return {
+        "user_id": user_id,
+        "allow_graduate_contact": allow_graduate_contact,
+        "personal_email": personal_email,
+        "notice_version": notice_version,
+    }
+
+
+def fetch_contact_preferences(user_id: int) -> Optional[dict[str, Any]]:
+    row = fetch_one(
+        """
+        SELECT user_id, allow_graduate_contact, personal_email,
+               notice_version, recorded_at
+        FROM dbo.contact_preferences
+        WHERE user_id = :user_id
+        """,
+        {"user_id": user_id},
+    )
+    if not row:
+        return None
+    row["allow_graduate_contact"] = _as_bool(row.get("allow_graduate_contact"))
+    return row
+
+
+def insert_follow_up_request(
+    *,
+    user_id: int,
+    topic: str,
+    details: Optional[str] = None,
+    source_response_id: Optional[int] = None,
+    response_preference: Optional[str] = None,
+) -> Optional[int]:
+    """INSERT dbo.follow_up_requests; skip if this source_response already has topic."""
+    topic = (topic or "").strip()[:100]
+    if not topic:
+        raise ValueError("topic is required")
+    details = (details or None) and str(details).strip()[:2000] or None
+    response_preference = (
+        (response_preference or None)
+        and str(response_preference).strip()[:100]
+        or None
+    )
+
+    with get_engine().begin() as conn:
+        if source_response_id is not None:
+            dup = conn.execute(
+                text(
+                    """
+                    SELECT follow_up_id
+                    FROM dbo.follow_up_requests
+                    WHERE user_id = :user_id
+                      AND source_response_id = :source_response_id
+                      AND topic = :topic
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "source_response_id": source_response_id,
+                    "topic": topic,
+                },
+            ).first()
+            if dup:
+                return int(dup.follow_up_id)
+
+        result = conn.execute(
+            text(
+                """
+                INSERT dbo.follow_up_requests (
+                    user_id, source_response_id, topic, details, response_preference
+                )
+                OUTPUT INSERTED.follow_up_id
+                VALUES (
+                    :user_id, :source_response_id, :topic, :details, :response_preference
+                )
+                """
+            ),
+            {
+                "user_id": user_id,
+                "source_response_id": source_response_id,
+                "topic": topic,
+                "details": details,
+                "response_preference": response_preference,
+            },
+        )
+        row = result.mappings().first()
+        return int(row["follow_up_id"]) if row else None
+
+
+def cancel_graduate_followup_assignments(*, user_id: int) -> int:
+    """Mark pending graduate wave assignments cancelled (contact withdrawal)."""
+    with get_engine().begin() as conn:
+        result = conn.execute(
+            text(
+                """
+                UPDATE dbo.survey_assignments
+                SET cancelled = 1
+                WHERE user_id = :user_id
+                  AND followup_month IS NOT NULL
+                  AND cancelled = 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM dbo.survey_responses r
+                      WHERE r.assignment_id = survey_assignments.assignment_id
+                        AND r.response_status = 'submitted'
+                  )
+                """
+            ),
+            {"user_id": user_id},
+        )
+        return int(result.rowcount or 0)
+
+
+def ensure_graduate_followup_assignments(
+    *,
+    user_id: int,
+    survey_version_id: Optional[int] = None,
+    graduation_date: Optional[date] = None,
+) -> list[dict[str, Any]]:
+    """Create after_0 assignments for months 3/6/12 when contact permission allows.
+
+    No-ops (returns []) when contact denied / missing, graduation_date missing,
+    or no published after_0 version. Messaging/invitations are out of scope —
+    this only stores due_at + followup_month rows.
+    """
+    prefs = fetch_contact_preferences(user_id)
+    if not prefs or not prefs.get("allow_graduate_contact"):
+        return []
+
+    if graduation_date is None:
+        prog = fetch_one(
+            """
+            SELECT graduation_date
+            FROM dbo.program_records
+            WHERE user_id = :user_id
+            """,
+            {"user_id": user_id},
+        )
+        raw = prog.get("graduation_date") if prog else None
+        if raw is None:
+            return []
+        if isinstance(raw, datetime):
+            graduation_date = raw.date()
+        elif isinstance(raw, date):
+            graduation_date = raw
+        else:
+            graduation_date = date.fromisoformat(str(raw)[:10])
+
+    if survey_version_id is None:
+        survey_version_id = resolve_published_after_grad_version_id()
+    if survey_version_id is None:
+        return []
+
+    created: list[dict[str, Any]] = []
+    with get_engine().begin() as conn:
+        for month in GRADUATE_FOLLOWUP_MONTHS:
+            event_key = graduate_assignment_event_key(month)
+            due = add_calendar_months(graduation_date, month)
+            due_at = datetime(due.year, due.month, due.day)
+            existing = conn.execute(
+                text(
+                    """
+                    SELECT assignment_id, cancelled, due_at, followup_month
+                    FROM dbo.survey_assignments
+                    WHERE user_id = :user_id
+                      AND survey_version_id = :survey_version_id
+                      AND event_key = :event_key
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "survey_version_id": survey_version_id,
+                    "event_key": event_key,
+                },
+            ).mappings().first()
+            if existing:
+                # Re-enable / refresh due_at if previously cancelled after re-consent.
+                if _as_bool(existing.get("cancelled")):
+                    conn.execute(
+                        text(
+                            """
+                            UPDATE dbo.survey_assignments
+                            SET cancelled = 0,
+                                due_at = :due_at,
+                                followup_month = :followup_month
+                            WHERE assignment_id = :assignment_id
+                            """
+                        ),
+                        {
+                            "due_at": due_at,
+                            "followup_month": month,
+                            "assignment_id": existing["assignment_id"],
+                        },
+                    )
+                created.append(
+                    {
+                        "assignment_id": int(existing["assignment_id"]),
+                        "followup_month": month,
+                        "event_key": event_key,
+                        "due_at": due.isoformat(),
+                        "created": False,
+                    }
+                )
+                continue
+
+            result = conn.execute(
+                text(
+                    """
+                    INSERT dbo.survey_assignments (
+                        user_id, survey_version_id, event_key,
+                        due_at, followup_month, cancelled
+                    )
+                    OUTPUT INSERTED.assignment_id
+                    VALUES (
+                        :user_id, :survey_version_id, :event_key,
+                        :due_at, :followup_month, 0
+                    )
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "survey_version_id": survey_version_id,
+                    "event_key": event_key,
+                    "due_at": due_at,
+                    "followup_month": month,
+                },
+            )
+            row = result.mappings().first()
+            created.append(
+                {
+                    "assignment_id": int(row["assignment_id"]) if row else None,
+                    "followup_month": month,
+                    "event_key": event_key,
+                    "due_at": due.isoformat(),
+                    "created": True,
+                }
+            )
+    return created
+
+
+def mark_alert_reviewed(
+    *,
+    alert_id: int,
+    reviewed_by: int,
+) -> bool:
+    """UPDATE alerts SET reviewed (granted column list only). Returns True if updated."""
+    with get_engine().begin() as conn:
+        result = conn.execute(
+            text(
+                """
+                UPDATE dbo.alerts
+                SET alert_status = 'reviewed',
+                    reviewed_by = :reviewed_by,
+                    reviewed_at = SYSUTCDATETIME()
+                WHERE alert_id = :alert_id
+                  AND alert_status = 'active'
+                """
+            ),
+            {"alert_id": alert_id, "reviewed_by": reviewed_by},
+        )
+        return int(result.rowcount or 0) > 0
+
+
+def apply_post_submit_side_effects(
+    result_row: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    actor_user_id: int,
+) -> dict[str, Any]:
+    """Aaron Phase F routing side effects after successful @submit=1.
+
+    1. near_0 → upsert contact_preferences from A9/A10; cancel or schedule
+       graduate assignments according to permission + graduation_date.
+    2. Any form Yes follow-up ask → INSERT follow_up_requests (idempotent per
+       source_response_id + topic).
+
+    Alerts evaluation is NOT done here — alerts student uses
+    register_after_submit_hook + DSA_ALERTS_EVAL_ENABLED.
+    """
+    summary: dict[str, Any] = {
+        "contact_preferences": None,
+        "follow_up_ids": [],
+        "graduate_assignments": [],
+        "cancelled_assignments": 0,
+    }
+    answers = payload.get("answers") or {}
+    if not isinstance(answers, Mapping):
+        answers = {}
+
+    response_id = _as_int_or_none(result_row.get("response_id"))
+    survey_version_id = _as_int_or_none(
+        result_row.get("survey_version_id")
+    ) or _as_int_or_none(payload.get("survey_version_id"))
+
+    meta = None
+    if survey_version_id is not None:
+        meta = fetch_survey_version_meta(survey_version_id)
+
+    # --- Contact prefs (near-grad) ---
+    is_near = bool(meta and meta.get("survey_code") == NEAR_GRAD_SURVEY_CODE)
+    contact = parse_contact_permission(answers) if is_near else None
+    if contact is not None and meta is not None:
+        notice = notice_version_label(
+            survey_code=str(meta.get("survey_code") or NEAR_GRAD_SURVEY_CODE),
+            version_number=meta.get("version_number") or 1,
+            variant=str(meta.get("variant") or "single"),
+        )
+        summary["contact_preferences"] = upsert_contact_preferences(
+            user_id=actor_user_id,
+            allow_graduate_contact=bool(contact["allow_graduate_contact"]),
+            personal_email=contact.get("personal_email"),
+            notice_version=notice,
+        )
+        if contact["allow_graduate_contact"]:
+            summary["graduate_assignments"] = ensure_graduate_followup_assignments(
+                user_id=actor_user_id
+            )
+        else:
+            summary["cancelled_assignments"] = cancel_graduate_followup_assignments(
+                user_id=actor_user_id
+            )
+
+    # --- Follow-up requests ---
+    for item in extract_follow_up_requests(answers):
+        fid = insert_follow_up_request(
+            user_id=actor_user_id,
+            topic=item["topic"],
+            details=item.get("details"),
+            source_response_id=response_id,
+        )
+        if fid is not None:
+            summary["follow_up_ids"].append(fid)
+
+    return summary
+

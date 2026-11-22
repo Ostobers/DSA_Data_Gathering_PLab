@@ -1,11 +1,29 @@
-// Draws a survey from surveys.js, handles show/hide logic, validation and the fake submit.
+// Draws a survey from surveys.js; posts drafts/final submits to Flask → save_survey_response.
 (function(){
 const S=SURVEYS[document.body.dataset.survey];
 const app=document.getElementById('app');
 let ver='long',fi=0,qs=[],f;
+// Draft / idempotency state for the current form+version.
+let draftRequestId=null, draftRevision=null, pendingAnswers=null;
 const form=()=>S.forms[fi];
 const esc=s=>String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
 const $=s=>f.querySelector(s);
+const variant=()=>form().singleVersion?'single':ver;
+const storageKey=()=>'dsaSurvey:'+[S.title,form().name,variant()].map(encodeURIComponent).join('|');
+
+function loadLocalDraftMeta(){
+ try{
+  const raw=sessionStorage.getItem(storageKey());
+  if(!raw)return null;
+  return JSON.parse(raw);
+ }catch(_){return null;}
+}
+function saveLocalDraftMeta(meta){
+ try{sessionStorage.setItem(storageKey(),JSON.stringify(meta));}catch(_){}
+}
+function clearLocalDraftMeta(){
+ try{sessionStorage.removeItem(storageKey());}catch(_){}
+}
 
 function getQs(){const F=form();if(F.singleVersion)return F.qs;return F[ver]?F[ver].qs:F.qs.filter(q=>F.shortIds.includes(q.id));}
 function getIntro(){const F=form();return (F[ver]&&F[ver].intro)||F.intro||'';}
@@ -240,53 +258,205 @@ function uuid(){
  });
 }
 
+function setInputValue(name,value){
+ const radios=[...f.querySelectorAll('input[type="radio"][name="'+name+'"]')];
+ if(radios.length){radios.forEach(r=>{r.checked=r.value===value;});return;}
+ const boxes=[...f.querySelectorAll('input[type="checkbox"][name="'+name+'"]')];
+ if(boxes.length){
+  const set=new Set(Array.isArray(value)?value:[]);
+  boxes.forEach(b=>{b.checked=set.has(b.value);});
+  return;
+ }
+ const el=$('[name="'+name+'"]');
+ if(el)el.value=value==null?'':value;
+}
+
+function applyAnswers(answers){
+ if(!answers||!f)return;
+ qs.forEach(q=>{
+  if(answers[q.id]===undefined)return;
+  const v=answers[q.id];
+  if(q.type=='grid'&&v&&typeof v==='object'){
+   q.rows.forEach(r=>{if(v[r]!=null)setInputValue(q.id+'__'+r,v[r]);});
+  }else if(q.type=='each'&&v&&typeof v==='object'){
+   // each rows are rebuilt in refresh(); stash then re-apply after.
+  }else if(q.type=='repeat'&&Array.isArray(v)){
+   const fs=$('[data-q="'+q.id+'"]');
+   const items=fs.querySelector('.repeat-items');
+   while(items.children.length<v.length)addRepeatItem(q);
+   while(items.children.length>Math.max(v.length,q.min||1))items.lastElementChild.remove();
+   updateRepeatButtons(q);
+   [...items.children].forEach((item,i)=>{
+    const row=v[i]||{};
+    q.o.forEach(s=>{
+     if(row[s.id]===undefined)return;
+     const field=item.querySelector('[data-field="'+s.id+'"]');
+     if(!field)return;
+     if(s.type=='grid'&&row[s.id]&&typeof row[s.id]==='object'){
+      s.rows.forEach((r,ri)=>{
+       const name=q.id+'__'+item.dataset.repeatItem+'__'+s.id+'__'+ri;
+       setInputValue(name,row[s.id][r]);
+      });
+     }else{
+      const name=q.id+'__'+item.dataset.repeatItem+'__'+s.id;
+      setInputValue(name,row[s.id]);
+     }
+     if(row[s.id+'_other']!=null){
+      const oth=field.querySelector('.oth');if(oth)oth.value=row[s.id+'_other'];
+     }
+    });
+   });
+  }else{
+   setInputValue(q.id,v);
+  }
+  if(answers[q.id+'_other']!=null){
+   const oth=$('[data-q="'+q.id+'"] > .oth');if(oth)oth.value=answers[q.id+'_other'];
+  }
+  if(answers[q.id+'_why']!=null){
+   const w=$('[data-q="'+q.id+'"] .why');if(w)w.value=answers[q.id+'_why'];
+  }
+ });
+ refresh();
+ // Second pass for each-rows created during refresh.
+ qs.filter(q=>q.type=='each').forEach(q=>{
+  const v=answers[q.id];if(!v||typeof v!=='object')return;
+  Object.keys(v).forEach(c=>setInputValue(q.id+'__'+c,v[c]));
+ });
+ refresh();
+}
+
 function drawForm(){
  qs=getQs();
  const F=form();
  versionPicker.hidden=!!F.singleVersion;
- box.innerHTML='<h2>'+F.name+(F.singleVersion?'':' ('+(ver=='short'?'Short':'Expanded')+' Version)')+'</h2><p>'+getIntro()+'</p><form novalidate>'+qs.map(qHTML).join('')+'<p class="note">Your answers are saved to the program database when you submit.</p><button type="submit">Submit</button></form>';
+ const local=loadLocalDraftMeta();
+ if(local&&local.request_id){draftRequestId=local.request_id;draftRevision=local.revision||null;}
+ else{draftRequestId=null;draftRevision=null;}
+ box.innerHTML='<h2>'+F.name+(F.singleVersion?'':' ('+(ver=='short'?'Short':'Expanded')+' Version)')+'</h2><p>'+getIntro()+'</p><form novalidate>'+qs.map(qHTML).join('')+'<p class="note">Save a draft anytime; final submit stores your response in the program database. Retries reuse the same request id.</p><div class="actions"><button type="button" class="save-draft">Save draft</button> <button type="submit">Submit</button></div><p class="draft-status note" aria-live="polite"></p></form>';
  f=box.querySelector('form');
  initRepeats();
  f.addEventListener('change',onChange);
  f.addEventListener('click',onClick);
+ f.querySelector('.save-draft').addEventListener('click',()=>{saveDraft();});
  f.addEventListener('submit',e=>{e.preventDefault();if(validate())done();});
  refresh();
+ if(pendingAnswers){applyAnswers(pendingAnswers);pendingAnswers=null;}
+ resumeDraft();
 }
 
 function thankYou(data,server){
+ clearLocalDraftMeta();
+ draftRequestId=null;draftRevision=null;
  const meta=server?('Response #'+server.response_id+' · revision '+server.revision+' · '+server.response_status):'';
  box.innerHTML='<h2>Thank you!</h2><p>Your response was saved.'+(meta?' <span class="note">'+esc(meta)+'</span>':'')+'</p><details><summary>Show the answers (for testing)</summary><pre>'+esc(JSON.stringify({payload:data,server:server||null},null,2))+'</pre></details><p><button id="again" type="button">Fill out again</button></p><p><a href="/surveys">Back to all surveys</a></p>';
- document.getElementById('again').onclick=drawForm;
+ document.getElementById('again').onclick=()=>{clearLocalDraftMeta();drawForm();};
  scrollTo(0,0);
 }
 
 function showSubmitError(msg,data){
- box.innerHTML='<h2>Could not save</h2><p class="err" role="alert">'+esc(msg||'Unknown error')+'</p><details><summary>Show the answers (for testing)</summary><pre>'+esc(JSON.stringify(data,null,2))+'</pre></details><p><button id="again" type="button">Try again</button></p><p><a href="/surveys">Back to all surveys</a></p>';
- document.getElementById('again').onclick=drawForm;
+ // Keep request_id in sessionStorage so Retry posts an identical idempotent payload.
+ box.innerHTML='<h2>Could not save</h2><p class="err" role="alert">'+esc(msg||'Unknown error')+'</p><details><summary>Show the answers (for testing)</summary><pre>'+esc(JSON.stringify(data,null,2))+'</pre></details><p><button id="retry" type="button">Retry submit</button> <button id="again" type="button">Edit answers</button></p><p><a href="/surveys">Back to all surveys</a></p>';
+ document.getElementById('again').onclick=()=>{pendingAnswers=data&&data.answers;drawForm();};
+ document.getElementById('retry').onclick=()=>done(data);
  scrollTo(0,0);
 }
 
-async function done(){
- // submitted_at, form and version match the collect() contract; request_id for idempotency.
+function setDraftStatus(msg){
+ const el=f&&f.querySelector('.draft-status');
+ if(el)el.textContent=msg||'';
+}
+
+function buildPayload(answers,submit){
+ if(!draftRequestId)draftRequestId=uuid();
  const data={
   survey:S.title,
   form:form().name,
-  version:form().singleVersion?'single':ver,
+  version:variant(),
   submitted_at:new Date().toISOString(),
-  request_id:uuid(),
-  answers:collect()
+  request_id:draftRequestId,
+  submit:!!submit,
+  answers:answers
  };
+ if(draftRevision!=null)data.expected_revision=draftRevision;
+ return data;
+}
+
+async function postResponse(data){
+ const res=await fetch('/api/surveys/responses',{
+  method:'POST',
+  headers:{'Content-Type':'application/json','Accept':'application/json'},
+  credentials:'same-origin',
+  body:JSON.stringify(data)
+ });
+ let body=null;
+ try{body=await res.json();}catch(_){body=null;}
+ return {res,body};
+}
+
+async function resumeDraft(){
+ const params=new URLSearchParams({survey:S.title,form:form().name,version:variant()});
+ try{
+  const res=await fetch('/api/surveys/drafts?'+params.toString(),{
+   headers:{'Accept':'application/json'},credentials:'same-origin'
+  });
+  const body=await res.json().catch(()=>null);
+  if(!res.ok||!body||!body.ok||!body.draft){
+   const local=loadLocalDraftMeta();
+   if(local&&local.request_id){
+    draftRequestId=local.request_id;
+    draftRevision=local.revision||null;
+    setDraftStatus(local.revision!=null?('Local draft request '+local.request_id+' · revision '+local.revision):'');
+   }
+   return;
+  }
+  const d=body.draft;
+  draftRequestId=d.request_id;
+  draftRevision=d.revision;
+  saveLocalDraftMeta({request_id:d.request_id,revision:d.revision});
+  applyAnswers(d.answers||{});
+  setDraftStatus('Resumed draft #'+d.response_id+' · revision '+d.revision);
+ }catch(_){
+  /* offline / no SQL — keep local meta only */
+ }
+}
+
+async function saveDraft(){
+ const answers=collect();
+ const data=buildPayload(answers,false);
+ const btn=f&&f.querySelector('.save-draft');
+ const submitBtn=f&&f.querySelector('button[type="submit"]');
+ if(btn){btn.disabled=true;btn.textContent='Saving draft…';}
+ if(submitBtn)submitBtn.disabled=true;
+ try{
+  const {res,body}=await postResponse(data);
+  if(!res.ok||!body||!body.ok){
+   setDraftStatus((body&&body.error)||('Draft save failed (HTTP '+res.status+').'));
+   return;
+  }
+  draftRequestId=body.request_id||draftRequestId;
+  draftRevision=body.revision;
+  saveLocalDraftMeta({request_id:draftRequestId,revision:draftRevision,answers:answers});
+  setDraftStatus('Draft saved · response #'+body.response_id+' · revision '+body.revision);
+ }catch(err){
+  setDraftStatus(err&&err.message?err.message:'Network error while saving draft.');
+ }finally{
+  if(btn){btn.disabled=false;btn.textContent='Save draft';}
+  if(submitBtn)submitBtn.disabled=false;
+ }
+}
+
+async function done(existing){
+ // Reuse request_id for idempotent final retry (same answers JSON).
+ const answers=existing&&existing.answers?existing.answers:collect();
+ if(existing&&existing.request_id)draftRequestId=existing.request_id;
+ if(existing&&existing.expected_revision!=null)draftRevision=existing.expected_revision;
+ const data=existing&&existing.submit!==false&&existing.answers?Object.assign({},existing,{submit:true,answers:answers}):buildPayload(answers,true);
+ data.submit=true;
+ saveLocalDraftMeta({request_id:data.request_id,revision:draftRevision,answers:answers});
  const btn=f&&f.querySelector('button[type="submit"]');
  if(btn){btn.disabled=true;btn.textContent='Saving…';}
  try{
-  const res=await fetch('/api/surveys/responses',{
-   method:'POST',
-   headers:{'Content-Type':'application/json','Accept':'application/json'},
-   credentials:'same-origin',
-   body:JSON.stringify(data)
-  });
-  let body=null;
-  try{body=await res.json();}catch(_){body=null;}
+  const {res,body}=await postResponse(data);
   if(!res.ok||!body||!body.ok){
    showSubmitError((body&&body.error)||('Save failed (HTTP '+res.status+').'),data);
    return;

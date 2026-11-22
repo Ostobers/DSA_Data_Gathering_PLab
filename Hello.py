@@ -21,6 +21,7 @@ from wtforms.validators import InputRequired, Length
 
 import db
 from seed_data import ALERTS, STUDENTS, USERS, alerts_for, dashboard_totals, student_by_id
+from survey_validation import validate_survey_answers
 
 app = Flask(__name__)
 # Prefer SECRET_KEY from the environment (compose/.env). Lab fallback keeps
@@ -431,8 +432,8 @@ def after_graduation():
     )
 
 
-def _basic_survey_payload_ok(body):
-    """Phase B stub: reject empty/malformed; nested/show validation is Phase C."""
+def _basic_survey_payload_ok(body, *, submit):
+    """Reject empty/malformed envelopes before DB work."""
     if not isinstance(body, dict):
         return False, "Request body must be a JSON object."
     survey = body.get("survey")
@@ -445,17 +446,54 @@ def _basic_survey_payload_ok(body):
         return False, "Missing form title."
     if not isinstance(version, str) or version not in ("single", "short", "long"):
         return False, "version must be single, short, or long."
-    if not isinstance(answers, dict) or len(answers) == 0:
+    if not isinstance(answers, dict):
+        return False, "answers must be a JSON object."
+    if submit and len(answers) == 0:
         return False, "answers must be a non-empty object."
     return True, None
+
+
+def _parse_optional_int(value, field_name):
+    if value is None or value == "":
+        return True, None
+    try:
+        return True, int(value)
+    except (TypeError, ValueError):
+        return False, f"{field_name} must be an integer."
+
+
+def _response_payload(result, request_id, survey_version_id):
+    return {
+        "ok": True,
+        "response_id": result.get("response_id"),
+        "request_id": str(result.get("request_id", request_id)),
+        "revision": result.get("revision"),
+        "response_status": result.get("response_status"),
+        "submitted_at": (
+            result["submitted_at"].isoformat()
+            if hasattr(result.get("submitted_at"), "isoformat")
+            else result.get("submitted_at")
+        ),
+        "survey_version_id": survey_version_id,
+        # Correction chain: accepted by POST when provided; UI/workflow later.
+        "supersedes_response_id": result.get("supersedes_response_id"),
+    }
 
 
 @app.route("/api/surveys/responses", methods=["POST"])
 @require_roles(*STUDENT_ROLES)
 def api_survey_responses():
-    """Persist a final survey submit via dbo.save_survey_response (@submit=1)."""
+    """Draft (@submit=0) or final submit via dbo.save_survey_response.
+
+    Idempotent final retry: same request_id + identical answers_json returns
+    the existing submitted row (SQL 51213 rejects mismatched payloads).
+    """
     body = request.get_json(silent=True)
-    ok, err = _basic_survey_payload_ok(body)
+    submit = True
+    if isinstance(body, dict) and "submit" in body:
+        submit = bool(body.get("submit"))
+
+    ok, err = _basic_survey_payload_ok(body, submit=submit)
     if not ok:
         return jsonify({"ok": False, "error": err}), 400
 
@@ -507,41 +545,180 @@ def api_survey_responses():
     if client_submitted_at is not None and not isinstance(client_submitted_at, str):
         return jsonify({"ok": False, "error": "submitted_at must be a string."}), 400
 
+    ok_rev, expected_revision = _parse_optional_int(
+        body.get("expected_revision"), "expected_revision"
+    )
+    if not ok_rev:
+        return jsonify({"ok": False, "error": expected_revision}), 400
+
+    ok_sup, supersedes_response_id = _parse_optional_int(
+        body.get("supersedes_response_id"), "supersedes_response_id"
+    )
+    if not ok_sup:
+        return jsonify({"ok": False, "error": supersedes_response_id}), 400
+
+    # Trusted Flask validation (show / repeats / grids / each / emails).
+    # Does not execute javascript_source from the database.
+    try:
+        bundle = db.fetch_survey_version_bundle(survey_version_id)
+    except (RuntimeError, SQLAlchemyError, DBAPIError) as exc:
+        return jsonify({"ok": False, "error": f"Database error: {exc}"}), 503
+    if not bundle:
+        return jsonify({"ok": False, "error": "Survey version not found."}), 404
+
+    valid, verr = validate_survey_answers(
+        bundle["questions"],
+        body["answers"],
+        submit=submit,
+        source_context=bundle["source_context"],
+    )
+    if not valid:
+        return jsonify({"ok": False, "error": verr}), 400
+
     try:
         result = db.save_survey_response(
             actor_user_id=actor_id,
             survey_version_id=survey_version_id,
             request_id=str(request_id),
             answers=body["answers"],
-            submit=True,
+            submit=submit,
             client_submitted_at=client_submitted_at,
+            expected_revision=expected_revision,
+            supersedes_response_id=supersedes_response_id,
         )
     except (RuntimeError, SQLAlchemyError, DBAPIError) as exc:
         # Surface SQL THROW messages when available (pyodbc).
         message = str(exc.orig) if getattr(exc, "orig", None) else str(exc)
         return jsonify({"ok": False, "error": message}), 400
 
-    # Alerts-student hook (no-op until evaluators register).
+    # Alerts-student hook only after successful final submit (Phase B seam).
+    if submit:
+        try:
+            db.run_after_submit_hooks(result, body, actor_id)
+        except Exception:
+            # Persist succeeded; alert evaluation failures must not undo submit.
+            app.logger.exception("after-submit hook failed")
+
+    return jsonify(_response_payload(result, request_id, survey_version_id)), 200
+
+
+@app.route("/api/surveys/responses/<request_id>", methods=["GET"])
+@require_roles(*STUDENT_ROLES)
+def api_get_survey_response(request_id):
+    """Resume a draft (or inspect a submitted response) by request_id."""
     try:
-        db.run_after_submit_hooks(result, body, actor_id)
-    except Exception:
-        # Persist succeeded; alert evaluation failures must not undo submit.
-        app.logger.exception("after-submit hook failed")
+        uuid.UUID(str(request_id))
+    except (ValueError, TypeError, AttributeError):
+        return jsonify({"ok": False, "error": "request_id must be a UUID."}), 400
+
+    actor_id = actor_user_id()
+    if actor_id is None:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "No dbo.users row mapped for this session username.",
+                }
+            ),
+            403,
+        )
+
+    try:
+        row = db.fetch_response_by_request_id(request_id, actor_user_id=actor_id)
+    except (RuntimeError, SQLAlchemyError, DBAPIError) as exc:
+        return jsonify({"ok": False, "error": f"Database error: {exc}"}), 503
+
+    if not row:
+        return jsonify({"ok": False, "error": "Response not found."}), 404
 
     return (
         jsonify(
             {
                 "ok": True,
-                "response_id": result.get("response_id"),
-                "request_id": str(result.get("request_id", request_id)),
-                "revision": result.get("revision"),
-                "response_status": result.get("response_status"),
+                "response_id": row.get("response_id"),
+                "request_id": str(row.get("request_id")),
+                "revision": row.get("revision"),
+                "response_status": row.get("response_status"),
+                "survey_version_id": row.get("survey_version_id"),
+                "answers": row.get("answers") or {},
+                "supersedes_response_id": row.get("supersedes_response_id"),
                 "submitted_at": (
-                    result["submitted_at"].isoformat()
-                    if hasattr(result.get("submitted_at"), "isoformat")
-                    else result.get("submitted_at")
+                    row["submitted_at"].isoformat()
+                    if hasattr(row.get("submitted_at"), "isoformat")
+                    else row.get("submitted_at")
                 ),
-                "survey_version_id": survey_version_id,
+            }
+        ),
+        200,
+    )
+
+
+@app.route("/api/surveys/drafts", methods=["GET"])
+@require_roles(*STUDENT_ROLES)
+def api_latest_survey_draft():
+    """Latest draft for the published survey/form/version triple."""
+    survey = (request.args.get("survey") or "").strip()
+    form = (request.args.get("form") or "").strip()
+    version = (request.args.get("version") or "").strip()
+    if not survey or not form or version not in ("single", "short", "long"):
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "Query params survey, form, and version are required.",
+                }
+            ),
+            400,
+        )
+
+    actor_id = actor_user_id()
+    if actor_id is None:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "No dbo.users row mapped for this session username.",
+                }
+            ),
+            403,
+        )
+
+    try:
+        survey_version_id = db.resolve_published_survey_version_id(
+            survey, form, version
+        )
+        if survey_version_id is None:
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "No published survey_version matches survey/form/version.",
+                    }
+                ),
+                404,
+            )
+        row = db.fetch_latest_draft(
+            actor_user_id=actor_id, survey_version_id=survey_version_id
+        )
+    except (RuntimeError, SQLAlchemyError, DBAPIError) as exc:
+        return jsonify({"ok": False, "error": f"Database error: {exc}"}), 503
+
+    if not row:
+        return jsonify({"ok": True, "draft": None}), 200
+
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "draft": {
+                    "response_id": row.get("response_id"),
+                    "request_id": str(row.get("request_id")),
+                    "revision": row.get("revision"),
+                    "response_status": row.get("response_status"),
+                    "survey_version_id": survey_version_id,
+                    "answers": row.get("answers") or {},
+                    "supersedes_response_id": row.get("supersedes_response_id"),
+                },
             }
         ),
         200,

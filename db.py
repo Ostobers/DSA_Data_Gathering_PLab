@@ -163,6 +163,117 @@ def lookup_user_id_by_username(username: str) -> Optional[int]:
     return int(row["id"]) if row else None
 
 
+def fetch_survey_version_bundle(survey_version_id: int) -> Optional[dict[str, Any]]:
+    """Published version row + question specs for Flask validation."""
+    version = fetch_one(
+        """
+        SELECT survey_version_id, survey_code, variant, survey_title, form_title,
+               audience, source_context_json, publication_status
+        FROM dbo.survey_versions
+        WHERE survey_version_id = :survey_version_id
+        """,
+        {"survey_version_id": survey_version_id},
+    )
+    if not version:
+        return None
+    questions = fetch_all(
+        """
+        SELECT question_code, ordinal, question_text, question_type,
+               is_required, specification_json
+        FROM dbo.survey_questions
+        WHERE survey_version_id = :survey_version_id
+        ORDER BY ordinal, question_code
+        """,
+        {"survey_version_id": survey_version_id},
+    )
+    ctx_raw = version.get("source_context_json") or "{}"
+    if isinstance(ctx_raw, str):
+        try:
+            source_context = json.loads(ctx_raw)
+        except json.JSONDecodeError:
+            source_context = {}
+    elif isinstance(ctx_raw, dict):
+        source_context = ctx_raw
+    else:
+        source_context = {}
+    return {
+        "version": version,
+        "questions": questions,
+        "source_context": source_context,
+    }
+
+
+def fetch_response_by_request_id(
+    request_id: str,
+    *,
+    actor_user_id: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    """Load a response (draft or submitted) by request_id.
+
+    When actor_user_id is set, require ownership (or anonymous owner NULL).
+    """
+    row = fetch_one(
+        """
+        SELECT response_id, request_id, user_id, survey_version_id, assignment_id,
+               term_id, supersedes_response_id, answers_json, revision,
+               response_status, submitted_at, client_submitted_at, updated_at
+        FROM dbo.survey_responses
+        WHERE request_id = :request_id
+        """,
+        {"request_id": request_id},
+    )
+    if not row:
+        return None
+    if actor_user_id is not None:
+        owner = row.get("user_id")
+        if owner is not None and int(owner) != int(actor_user_id):
+            return None
+    answers_raw = row.get("answers_json")
+    if isinstance(answers_raw, str):
+        row["answers"] = json.loads(answers_raw)
+    else:
+        row["answers"] = answers_raw or {}
+    return row
+
+
+def fetch_latest_draft(
+    *,
+    actor_user_id: int,
+    survey_version_id: int,
+) -> Optional[dict[str, Any]]:
+    """Most recently updated draft for this student + published version."""
+    row = fetch_one(
+        """
+        SELECT TOP 1 response_id, request_id, user_id, survey_version_id,
+               assignment_id, term_id, supersedes_response_id, answers_json,
+               revision, response_status, submitted_at, client_submitted_at,
+               updated_at
+        FROM dbo.survey_responses
+        WHERE user_id = :actor_user_id
+          AND survey_version_id = :survey_version_id
+          AND response_status = 'draft'
+        ORDER BY updated_at DESC, response_id DESC
+        """,
+        {
+            "actor_user_id": actor_user_id,
+            "survey_version_id": survey_version_id,
+        },
+    )
+    if not row:
+        return None
+    answers_raw = row.get("answers_json")
+    if isinstance(answers_raw, str):
+        row["answers"] = json.loads(answers_raw)
+    else:
+        row["answers"] = answers_raw or {}
+    return row
+
+
+def canonical_answers_json(answers: Mapping[str, Any]) -> str:
+    """Stable JSON used for proc writes and identical-retry idempotency."""
+    return json.dumps(answers, ensure_ascii=False, separators=(",", ":"))
+
+
 def save_survey_response(
     *,
     actor_user_id: int,
@@ -176,7 +287,7 @@ def save_survey_response(
     term_id: Optional[int] = None,
     supersedes_response_id: Optional[int] = None,
 ) -> dict[str, Any]:
-    answers_json = json.dumps(answers, ensure_ascii=False, separators=(",", ":"))
+    answers_json = canonical_answers_json(answers)
     rows = exec_proc(
         "dbo.save_survey_response",
         {

@@ -177,7 +177,23 @@ def _student_from_sql_student_id(student_id, *, with_history=False):
         uid = row.get("user_id")
         history = _try_sql(lambda: db.fetch_checkin_history(int(uid))) if uid else []
         checkins = history if history is not None else []
-    return db.map_student_dashboard_row(row, checkins=checkins)
+    student = db.map_student_dashboard_row(row, checkins=checkins)
+    return _attach_graduate_outcomes(student)
+
+
+def _attach_graduate_outcomes(student):
+    """Optional faculty read of v_latest_graduate_outcomes (R10: latest only)."""
+    if not student:
+        return student
+    uid = student.get("user_id")
+    if uid is None:
+        return student
+    rows = _try_sql(lambda: db.fetch_latest_graduate_outcomes(int(uid)))
+    if not rows:
+        return student
+    student = dict(student)
+    student["employment"] = db.map_graduate_outcomes_row(rows[0])
+    return student
 
 
 def _resolve_student_for_session(user, *, with_history=False):
@@ -506,12 +522,37 @@ def student_detail(student_id):
 @app.route("/faculty/alerts/<alert_id>/review", methods=["POST"])
 @require_roles(*FACULTY_ROLES)
 def review_alert(alert_id):
-    # Alert review UPDATE is Phase F; keep seed-list mutation for demo only.
-    for alert in ALERTS:
-        if alert["id"] == alert_id:
-            alert["status"] = "reviewed"
-            flash("Alert marked reviewed.")
-            break
+    """Mark an alert reviewed. Route shape unchanged; SQL UPDATE when connected."""
+    reviewer_id = actor_user_id()
+    try:
+        alert_pk = int(alert_id)
+    except (TypeError, ValueError):
+        alert_pk = None
+
+    if alert_pk is not None and reviewer_id is not None and db.sql_configured():
+        try:
+            updated = db.mark_alert_reviewed(
+                alert_id=alert_pk, reviewed_by=reviewer_id
+            )
+            if updated:
+                flash("Alert marked reviewed.")
+            else:
+                flash("Alert was not active or was not found.", "error")
+            return redirect(url_for("faculty_home"))
+        except (RuntimeError, SQLAlchemyError, DBAPIError):
+            app.logger.exception("SQL alert review failed; trying seed fallback")
+
+    # Demo seed-list mutation when SQL is unavailable / reviewer unmapped.
+    if db.USE_SEED_DATA:
+        for alert in ALERTS:
+            if alert["id"] == alert_id:
+                alert["status"] = "reviewed"
+                flash("Alert marked reviewed.")
+                break
+        else:
+            flash("Alert was not found.", "error")
+    else:
+        flash("Could not review alert (SQL unavailable).", "error")
     return redirect(url_for("faculty_home"))
 
 
@@ -923,13 +964,26 @@ def api_survey_responses():
         message = str(exc.orig) if getattr(exc, "orig", None) else str(exc)
         return jsonify({"ok": False, "error": message}), 400
 
-    # Alerts-student hook only after successful final submit (Phase B seam).
+    # Phase F routing side effects + alerts-student extension point.
+    # Contact prefs / follow-ups / graduate assignments always attempt after
+    # successful final submit. Alert evaluators run only when
+    # DSA_ALERTS_EVAL_ENABLED=1 and register_after_submit_hook(...) is used.
     if submit:
+        # Ensure side-effect helpers see the resolved version id.
+        side_payload = dict(body)
+        side_payload["survey_version_id"] = survey_version_id
+        side_result = dict(result)
+        side_result.setdefault("survey_version_id", survey_version_id)
         try:
-            db.run_after_submit_hooks(result, body, actor_id)
+            db.apply_post_submit_side_effects(side_result, side_payload, actor_id)
+        except Exception:
+            # Persist succeeded; side-effect failures must not undo submit.
+            app.logger.exception("post-submit side effects failed")
+        try:
+            db.run_after_submit_hooks(side_result, side_payload, actor_id)
         except Exception:
             # Persist succeeded; alert evaluation failures must not undo submit.
-            app.logger.exception("after-submit hook failed")
+            app.logger.exception("after-submit alerts hook failed")
 
     return jsonify(_response_payload(result, request_id, survey_version_id)), 200
 

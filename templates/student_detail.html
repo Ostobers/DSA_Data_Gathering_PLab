@@ -36,6 +36,9 @@
       <h3>Graduate employment</h3>
       <p>{{ student.employment.status }} · {{ student.employment.title }} · {{ student.employment.industry }}</p>
       <p>Uses data-science skills: {{ student.employment.uses_ds }}</p>
+      {% if student.employment.r10_note %}
+      <p class="note">{{ student.employment.r10_note }}</p>
+      {% endif %}
     {% endif %}
   </article>
 </div>

@@ -1,11 +1,13 @@
 """Flask app with server-side role gates for Jinja templates."""
 
 import os
+import uuid
 from functools import wraps
 
 from flask import (
     Flask,
     flash,
+    jsonify,
     redirect,
     render_template,
     request,
@@ -13,9 +15,11 @@ from flask import (
     url_for,
 )
 from flask_wtf import FlaskForm
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from wtforms import PasswordField, StringField, SubmitField
 from wtforms.validators import InputRequired, Length
 
+import db
 from seed_data import ALERTS, STUDENTS, USERS, alerts_for, dashboard_totals, student_by_id
 
 app = Flask(__name__)
@@ -59,6 +63,28 @@ def current_user():
     if not username:
         return None
     return USERS.get(username)
+
+
+def actor_user_id():
+    """Temporary session → dbo.users.id seam (login student replaces later).
+
+    Looks up the demo session username in SQL. Returns None when the account
+    has not been provisioned in dbo.users yet.
+    """
+    user = current_user()
+    if not user:
+        return None
+    # Optional override for lab smoke (e.g. DSA_ACTOR_USER_ID=2).
+    override = os.environ.get("DSA_ACTOR_USER_ID")
+    if override:
+        try:
+            return int(override)
+        except ValueError:
+            pass
+    try:
+        return db.lookup_user_id_by_username(user["username"])
+    except (RuntimeError, SQLAlchemyError, DBAPIError):
+        return None
 
 
 @app.context_processor
@@ -403,6 +429,133 @@ def after_graduation():
         title="After Graduation Survey",
         survey_key="after",
     )
+
+
+def _basic_survey_payload_ok(body):
+    """Phase B stub: reject empty/malformed; nested/show validation is Phase C."""
+    if not isinstance(body, dict):
+        return False, "Request body must be a JSON object."
+    survey = body.get("survey")
+    form = body.get("form")
+    version = body.get("version")
+    answers = body.get("answers")
+    if not isinstance(survey, str) or not survey.strip():
+        return False, "Missing survey title."
+    if not isinstance(form, str) or not form.strip():
+        return False, "Missing form title."
+    if not isinstance(version, str) or version not in ("single", "short", "long"):
+        return False, "version must be single, short, or long."
+    if not isinstance(answers, dict) or len(answers) == 0:
+        return False, "answers must be a non-empty object."
+    return True, None
+
+
+@app.route("/api/surveys/responses", methods=["POST"])
+@require_roles(*STUDENT_ROLES)
+def api_survey_responses():
+    """Persist a final survey submit via dbo.save_survey_response (@submit=1)."""
+    body = request.get_json(silent=True)
+    ok, err = _basic_survey_payload_ok(body)
+    if not ok:
+        return jsonify({"ok": False, "error": err}), 400
+
+    actor_id = actor_user_id()
+    if actor_id is None:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": (
+                        "No dbo.users row mapped for this session username. "
+                        "Login student must provision SQL accounts; lab may "
+                        "set DSA_ACTOR_USER_ID temporarily."
+                    ),
+                }
+            ),
+            403,
+        )
+
+    try:
+        survey_version_id = db.resolve_published_survey_version_id(
+            body["survey"].strip(),
+            body["form"].strip(),
+            body["version"].strip(),
+        )
+    except (RuntimeError, SQLAlchemyError, DBAPIError) as exc:
+        return jsonify({"ok": False, "error": f"Database error: {exc}"}), 503
+
+    if survey_version_id is None:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "No published survey_version matches survey/form/version.",
+                }
+            ),
+            404,
+        )
+
+    request_id = body.get("request_id")
+    if not request_id:
+        request_id = str(uuid.uuid4())
+    try:
+        uuid.UUID(str(request_id))
+    except (ValueError, TypeError, AttributeError):
+        return jsonify({"ok": False, "error": "request_id must be a UUID."}), 400
+
+    client_submitted_at = body.get("submitted_at")
+    if client_submitted_at is not None and not isinstance(client_submitted_at, str):
+        return jsonify({"ok": False, "error": "submitted_at must be a string."}), 400
+
+    try:
+        result = db.save_survey_response(
+            actor_user_id=actor_id,
+            survey_version_id=survey_version_id,
+            request_id=str(request_id),
+            answers=body["answers"],
+            submit=True,
+            client_submitted_at=client_submitted_at,
+        )
+    except (RuntimeError, SQLAlchemyError, DBAPIError) as exc:
+        # Surface SQL THROW messages when available (pyodbc).
+        message = str(exc.orig) if getattr(exc, "orig", None) else str(exc)
+        return jsonify({"ok": False, "error": message}), 400
+
+    # Alerts-student hook (no-op until evaluators register).
+    try:
+        db.run_after_submit_hooks(result, body, actor_id)
+    except Exception:
+        # Persist succeeded; alert evaluation failures must not undo submit.
+        app.logger.exception("after-submit hook failed")
+
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "response_id": result.get("response_id"),
+                "request_id": str(result.get("request_id", request_id)),
+                "revision": result.get("revision"),
+                "response_status": result.get("response_status"),
+                "submitted_at": (
+                    result["submitted_at"].isoformat()
+                    if hasattr(result.get("submitted_at"), "isoformat")
+                    else result.get("submitted_at")
+                ),
+                "survey_version_id": survey_version_id,
+            }
+        ),
+        200,
+    )
+
+
+@app.route("/api/db/smoke", methods=["GET"])
+@require_roles(*ADMIN_ROLES)
+def api_db_smoke():
+    """Phase A smoke: schema_migrations + published survey_versions count."""
+    try:
+        return jsonify({"ok": True, **db.smoke_select()}), 200
+    except (RuntimeError, SQLAlchemyError, DBAPIError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 503
 
 
 if __name__ == "__main__":

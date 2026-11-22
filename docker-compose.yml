@@ -31,12 +31,13 @@ services:
       - .env
     environment:
       SECRET_KEY: ${SECRET_KEY}
-      # Optional placeholders for a future SQLAlchemy/ODBC wiring (unused by Hello.py today).
+      # SQLAlchemy/ODBC (db.py) — dsa_app → DSA_Student_Success
       MSSQL_HOST: ${MSSQL_HOST:-db}
       MSSQL_PORT: ${MSSQL_PORT:-1433}
       MSSQL_DATABASE: ${MSSQL_DATABASE:-DSA_Student_Success}
       MSSQL_USER: ${MSSQL_USER:-}
       MSSQL_PASSWORD: ${MSSQL_PASSWORD:-}
+      USE_SEED_DATA: ${USE_SEED_DATA:-1}
     ports:
       - "5000:5000"
     depends_on:

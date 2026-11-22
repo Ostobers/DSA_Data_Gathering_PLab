@@ -233,11 +233,18 @@ function collect(){
  return out;
 }
 
+function uuid(){
+ if(crypto&&crypto.randomUUID)return crypto.randomUUID();
+ return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{
+  const r=Math.random()*16|0;return (c==='x'?r:(r&0x3|0x8)).toString(16);
+ });
+}
+
 function drawForm(){
  qs=getQs();
  const F=form();
  versionPicker.hidden=!!F.singleVersion;
- box.innerHTML='<h2>'+F.name+(F.singleVersion?'':' ('+(ver=='short'?'Short':'Expanded')+' Version)')+'</h2><p>'+getIntro()+'</p><form novalidate>'+qs.map(qHTML).join('')+'<p class="note">Responses are not saved (prototype).</p><button type="submit">Submit</button></form>';
+ box.innerHTML='<h2>'+F.name+(F.singleVersion?'':' ('+(ver=='short'?'Short':'Expanded')+' Version)')+'</h2><p>'+getIntro()+'</p><form novalidate>'+qs.map(qHTML).join('')+'<p class="note">Your answers are saved to the program database when you submit.</p><button type="submit">Submit</button></form>';
  f=box.querySelector('form');
  initRepeats();
  f.addEventListener('change',onChange);
@@ -246,13 +253,48 @@ function drawForm(){
  refresh();
 }
 
-function done(){
- // submitted_at, form and version are included so repeated check-ins can be stored later.
- const data={survey:S.title,form:form().name,version:form().singleVersion?'single':ver,submitted_at:new Date().toISOString(),answers:collect()};
- console.log(data);
- box.innerHTML='<h2>Thank you!</h2><p>Your response was submitted. <strong>This is a prototype: responses are not saved anywhere.</strong></p><details><summary>Show the answers (for testing)</summary><pre>'+esc(JSON.stringify(data,null,2))+'</pre></details><p><button id="again" type="button">Fill out again</button></p><p><a href="/surveys">Back to all surveys</a></p>';
+function thankYou(data,server){
+ const meta=server?('Response #'+server.response_id+' · revision '+server.revision+' · '+server.response_status):'';
+ box.innerHTML='<h2>Thank you!</h2><p>Your response was saved.'+(meta?' <span class="note">'+esc(meta)+'</span>':'')+'</p><details><summary>Show the answers (for testing)</summary><pre>'+esc(JSON.stringify({payload:data,server:server||null},null,2))+'</pre></details><p><button id="again" type="button">Fill out again</button></p><p><a href="/surveys">Back to all surveys</a></p>';
  document.getElementById('again').onclick=drawForm;
  scrollTo(0,0);
+}
+
+function showSubmitError(msg,data){
+ box.innerHTML='<h2>Could not save</h2><p class="err" role="alert">'+esc(msg||'Unknown error')+'</p><details><summary>Show the answers (for testing)</summary><pre>'+esc(JSON.stringify(data,null,2))+'</pre></details><p><button id="again" type="button">Try again</button></p><p><a href="/surveys">Back to all surveys</a></p>';
+ document.getElementById('again').onclick=drawForm;
+ scrollTo(0,0);
+}
+
+async function done(){
+ // submitted_at, form and version match the collect() contract; request_id for idempotency.
+ const data={
+  survey:S.title,
+  form:form().name,
+  version:form().singleVersion?'single':ver,
+  submitted_at:new Date().toISOString(),
+  request_id:uuid(),
+  answers:collect()
+ };
+ const btn=f&&f.querySelector('button[type="submit"]');
+ if(btn){btn.disabled=true;btn.textContent='Saving…';}
+ try{
+  const res=await fetch('/api/surveys/responses',{
+   method:'POST',
+   headers:{'Content-Type':'application/json','Accept':'application/json'},
+   credentials:'same-origin',
+   body:JSON.stringify(data)
+  });
+  let body=null;
+  try{body=await res.json();}catch(_){body=null;}
+  if(!res.ok||!body||!body.ok){
+   showSubmitError((body&&body.error)||('Save failed (HTTP '+res.status+').'),data);
+   return;
+  }
+  thankYou(data,body);
+ }catch(err){
+  showSubmitError(err&&err.message?err.message:'Network error while saving.',data);
+ }
 }
 
 app.innerHTML='<h1>'+S.title+'</h1><p>'+(S.intro||'')+'</p>'+
